@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>全制程NG不良智能归因分析</title>
+<link rel="stylesheet" href="/static/css/style.css">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+<div class="app">
+  <!-- Header -->
+  <header class="header">
+    <div class="header-content">
+      <div class="logo">
+        <div class="logo-icon">⚙</div>
+        <div>
+          <h1>全制程NG不良智能归因分析</h1>
+          <p class="subtitle">基于制程全要素的"偏移"不良相关性分析平台</p>
+        </div>
+      </div>
+      <div class="header-badge">Statistical Correlation Engine</div>
+    </div>
+  </header>
+
+  <!-- Control Panel -->
+  <section class="control-panel">
+    <div class="panel-grid">
+      <!-- Upload -->
+      <div class="panel-card">
+        <h3><span class="step-num">1</span> 数据输入</h3>
+        <div class="upload-area" id="uploadArea">
+          <div class="upload-icon">📊</div>
+          <p>拖拽或点击上传全制程Excel</p>
+          <input type="file" id="dataFile" accept=".xlsx,.xls,.csv" hidden>
+        </div>
+        <div class="upload-row">
+          <label class="file-label" id="filterLabel">
+            <input type="file" id="filterFile" accept=".xlsx,.xls,.csv" hidden>
+            📋 上传筛选列表 (可选)
+          </label>
+        </div>
+        <button class="btn btn-primary" id="btnAnalyze" disabled>开始分析</button>
+
+      </div>
+      <!-- Time Filter -->
+      <div class="panel-card">
+        <h3><span class="step-num">2</span> 时间筛选</h3>
+        <div class="date-row">
+          <label>开始日期<input type="date" id="dateStart"></label>
+          <label>结束日期<input type="date" id="dateEnd"></label>
+        </div>
+        <div class="topn-row">
+          <label>Top N
+            <select id="topN">
+              <option value="5">Top 5</option>
+              <option value="10" selected>Top 10</option>
+              <option value="15">Top 15</option>
+              <option value="20">Top 20</option>
+            </select>
+          </label>
+        </div>
+        <button class="btn btn-filter" id="btnFilter" disabled>🔍 按时间筛选分析</button>
+        <p class="date-hint" id="dateHint">请先加载数据</p>
+      </div>
+      <!-- Summary -->
+      <div class="panel-card summary-card" id="summaryPanel" style="display:none">
+        <h3><span class="step-num">3</span> 数据概览</h3>
+        <div class="stats-grid">
+          <div class="stat"><div class="stat-value" id="statTotal">-</div><div class="stat-label">总样本</div></div>
+          <div class="stat pass"><div class="stat-value" id="statPass">-</div><div class="stat-label">Pass</div></div>
+          <div class="stat fail"><div class="stat-value" id="statFail">-</div><div class="stat-label">Fail</div></div>
+          <div class="stat rate"><div class="stat-value" id="statRate">-</div><div class="stat-label">不良率</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Loading -->
+  <div class="loading" id="loading" style="display:none">
+    <div class="spinner"></div>
+    <p>正在进行相关性分析...</p>
+  </div>
+
+  <!-- Charts -->
+  <section class="charts-section" id="chartsSection" style="display:none">
+    <div class="section-title">
+      <h2>统计分析结果可视化</h2>
+      <p>Top关键指标展示</p>
+    </div>
+
+    <!-- LLM Summary Section -->
+    <section class="llm-section" id="llmSection" style="display:none">
+      <div class="llm-container">
+        <div class="llm-header">
+          <div class="llm-badge">3</div>
+          <div class="llm-title-group">
+            <h2>LLM 结构化总结与输出</h2>
+            <p>统计矩阵 → 可读排查指引</p>
+          </div>
+        </div>
+        <div class="llm-content">
+          <div class="llm-status" id="llmStatus">正在调用公司模型生成总结...</div>
+          <div class="markdown-body" id="llmOutput"></div>
+        </div>
+      </div>
+    </section>
+
+    <div class="charts-grid">
+      <div class="chart-card">
+        <h3>📊 相关性 Top N</h3>
+        <p class="chart-sub">Correlation Score Ranking</p>
+        <div class="chart" id="chartCorrelation"></div>
+      </div>
+      <div class="chart-card">
+        <h3>📈 Pass/NG 分层对比</h3>
+        <p class="chart-sub">Pass/NG Stratified Comparison</p>
+        <div class="chart" id="chartPassNG"></div>
+      </div>
+      <div class="chart-card">
+        <h3>🔧 硬件单元归因</h3>
+        <p class="chart-sub">Hardware Unit NG Attribution</p>
+        <div class="chart" id="chartHardware"></div>
+      </div>
+      <div class="chart-card">
+        <h3>📦 时序参数分布对比</h3>
+        <p class="chart-sub">Box Plot: Pass vs NG</p>
+        <div class="chart" id="chartBoxplot"></div>
+      </div>
+    </div>
+    <div class="charts-grid">
+      <div class="chart-card">
+        <h3>📅 NG趋势</h3>
+        <p class="chart-sub">Daily NG Rate Trend</p>
+        <div class="chart" id="chartTrend"></div>
+      </div>
+      <div class="chart-card">
+        <h3>🏭 失败工站分布</h3>
+        <p class="chart-sub">Failed Station Distribution</p>
+        <div class="chart" id="chartStation"></div>
+      </div>
+    </div>
+    <!-- Correlation Table -->
+    <div class="table-card">
+      <h3>📋 全部相关性排名</h3>
+      <table id="corrTable">
+        <thead><tr><th>排名</th><th>特征列</th><th>相关性分数</th><th>类型</th><th>方法</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+<script src="/static/js/app.js"></script>
+</body>
+</html>
