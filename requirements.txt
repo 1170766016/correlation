@@ -3,3 +3,5 @@ pandas
 plotly
 requests
 openpyxl
+python-calamine
+pyarrow
