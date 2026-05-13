@@ -65,26 +65,46 @@ def load_dashboard_dict():
 
 
 @st.cache_data(show_spinner="正在加载数据...", max_entries=2)
-def load_data_from_path(file_path, usecols_tuple):
-    """从文件路径加载CSV（缓存），usecols_tuple 为 tuple 或 None"""
+def load_data_from_path(file_path, usecols_tuple, is_excel=False):
+    """从文件路径加载数据（缓存），usecols_tuple 为 tuple 或 None"""
     usecols = list(usecols_tuple) if usecols_tuple else None
+    if is_excel:
+        picker = (lambda c: c in usecols) if usecols else None
+        try:
+            return pd.read_excel(file_path, engine="calamine", usecols=picker)
+        except (ImportError, ValueError):
+            return pd.read_excel(file_path, engine="openpyxl", usecols=picker)
     return pd.read_csv(file_path, usecols=usecols, low_memory=False)
 
 
 def load_data(file_path=None, uploaded_file=None, dashboard_cols=None):
-    """加载CSV数据，优先使用上传文件，其次使用本地默认文件"""
+    """加载数据，优先使用上传文件，其次使用本地默认文件"""
     if uploaded_file is not None:
+        if uploaded_file.name.lower().endswith(('.xlsx', '.xls')):
+            try:
+                return pd.read_excel(uploaded_file, engine="calamine")
+            except (ImportError, ValueError):
+                return pd.read_excel(uploaded_file, engine="openpyxl")
         return pd.read_csv(uploaded_file, low_memory=False)
+        
     if file_path and os.path.exists(file_path):
+        is_excel = file_path.lower().endswith(('.xlsx', '.xls'))
         if dashboard_cols:
-            csv_cols = pd.read_csv(file_path, nrows=0).columns.tolist()
-            use_cols = [c for c in dashboard_cols if c in csv_cols and c not in SKIP_COLS]
-            use_cols_extra = [c for c in ['Date', 'Results', 'Failed_Station', 'Failure_Mode'] if c in csv_cols]
+            if is_excel:
+                try:
+                    file_cols = pd.read_excel(file_path, engine="calamine", nrows=1).columns.tolist()
+                except (ImportError, ValueError):
+                    file_cols = pd.read_excel(file_path, engine="openpyxl", nrows=1).columns.tolist()
+            else:
+                file_cols = pd.read_csv(file_path, nrows=0).columns.tolist()
+                
+            use_cols = [c for c in dashboard_cols if c in file_cols and c not in SKIP_COLS]
+            use_cols_extra = [c for c in ['Date', 'Results', 'Failed_Station', 'Failure_Mode'] if c in file_cols]
             for c in use_cols_extra:
                 if c not in use_cols:
                     use_cols.append(c)
-            return load_data_from_path(file_path, tuple(use_cols))
-        return load_data_from_path(file_path, None)
+            return load_data_from_path(file_path, tuple(use_cols), is_excel=is_excel)
+        return load_data_from_path(file_path, None, is_excel=is_excel)
     return None
 
 
@@ -320,7 +340,7 @@ def call_llm(api_key, api_base, model, top10_data, desc_map, failed_station, fai
         hour_items = []
         for item in hour_top10_data:
             hour_items.append({
-                '工序': item['feature'].replace('_Hour', ''),
+                '工序': item['feature'].replace('_DayHour', ''),
                 '聚集小时': f"{item['value']}时",
                 'Lift': item['lift'],
                 'Fail内占比': f"{item['fail_ratio']*100:.1f}%",
@@ -388,15 +408,15 @@ def _get_cache_key(start_date, end_date, failed_station, lift_weight):
     return f"{start_date}_{end_date}_{failed_station}_{lift_weight}"
 
 
-def extract_hour_features(df):
-    """检测时间列，抽取小时(0-23)作为离散特征，返回(修改后df, 新增小时特征列名列表)
+def extract_dayhour_features(df):
+    """检测时间列，抽取日期+小时(MM-DD HH:00)作为离散特征，返回(修改后df, 新增列名列表)
     只处理 _End_Time 和 _Start_Time 列（实际时间戳），不处理 _Staging_time（持续秒数）
     """
-    hour_cols = []
+    dayhour_cols = []
     time_pattern = re.compile(r'_End_Time$|_Start_Time$|_datetime$', re.IGNORECASE)
     n = len(df)
     if n == 0:
-        return df, hour_cols
+        return df, dayhour_cols
 
     for col in list(df.columns):
         if col in SKIP_COLS or not time_pattern.search(col):
@@ -409,12 +429,12 @@ def extract_hour_features(df):
             valid_ratio = parsed.notna().sum() / n
             if valid_ratio < 0.3:
                 continue
-            hour_col = f"{col}_Hour"
-            df[hour_col] = parsed.dt.hour.astype("Int64")
-            hour_cols.append(hour_col)
+            dayhour_col = f"{col}_DayHour"
+            df[dayhour_col] = parsed.dt.strftime("%m-%d %H:00")
+            dayhour_cols.append(dayhour_col)
         except Exception:
             continue
-    return df, hour_cols
+    return df, dayhour_cols
 
 
 def main():
@@ -423,7 +443,7 @@ def main():
 
     # ── 侧边栏：数据源 ──
     st.sidebar.header("数据源")
-    uploaded_file = st.sidebar.file_uploader("上传CSV文件（可选）", type=["csv"])
+    uploaded_file = st.sidebar.file_uploader("上传数据文件（可选）", type=["csv", "xlsx", "xls"])
     use_default = st.sidebar.checkbox("使用本地 PRB_data.csv", value=True)
 
     if LLM_API_KEY and LLM_API_KEY != "sk-your-api-key-here":
@@ -463,7 +483,7 @@ def main():
                 st.session_state['df_raw'] = load_data(file_path=DATA_PATH, dashboard_cols=dashboard_cols)
             st.session_state['uploaded_name'] = None
         else:
-            st.sidebar.warning("请上传CSV文件或勾选使用本地数据")
+            st.sidebar.warning("请上传数据文件或勾选使用本地数据")
             st.info("请先在左侧配置数据源。")
             return
 
@@ -652,22 +672,22 @@ def main():
         lift_progress_text.markdown("正在提取时间小时特征...")
         time_cols, _, _, _ = classify_columns(df_base)
         if time_cols:
-            df_base, hour_cols = extract_hour_features(df_base)
-            df_fail, _ = extract_hour_features(df_fail)
-            if hour_cols:
+            df_base, dayhour_cols = extract_dayhour_features(df_base)
+            df_fail, _ = extract_dayhour_features(df_fail)
+            if dayhour_cols:
                 lift_progress_text.markdown("正在计算时间类提升度（小时）...")
-                hour_results, hour_ratio_raw, _ = compute_lift(
-                    df_base, df_fail, hour_cols, lift_weight=lift_weight, min_count=1
+                dayhour_results, dayhour_ratio_raw, _ = compute_lift(
+                    df_base, df_fail, dayhour_cols, lift_weight=lift_weight, min_count=1
                 )
-                hour_lift_results = hour_results
-                hour_ratio_results = hour_ratio_raw
+                dayhour_lift_results = dayhour_results
+                dayhour_ratio_results = dayhour_ratio_raw
             else:
-                hour_lift_results = []
+                dayhour_lift_results = []
         else:
-            hour_lift_results = []
-        hour_top10 = get_top10_by_feature(hour_lift_results) if hour_lift_results else []
-        hour_ratio_top10 = (get_top10_by_feature(hour_ratio_results, sort_key='fail_ratio')
-                            if hour_ratio_results else [])
+            dayhour_lift_results = []
+        dayhour_top10 = get_top10_by_feature(dayhour_lift_results) if dayhour_lift_results else []
+        dayhour_ratio_top10 = (get_top10_by_feature(dayhour_ratio_results, sort_key='fail_ratio')
+                               if dayhour_ratio_results else [])
 
         lift_progress.progress(1.0)
         lift_progress_text.markdown("分析完成!")
@@ -684,10 +704,13 @@ def main():
         st.session_state['n_base'] = n_base
         st.session_state['n_fail'] = n_fail
         st.session_state['all_feature_cols'] = all_feature_cols
-        st.session_state['hour_lift_results'] = hour_lift_results
-        st.session_state['hour_top10'] = hour_top10
-        st.session_state['hour_ratio_results'] = hour_ratio_results
-        st.session_state['hour_ratio_top10'] = hour_ratio_top10
+        st.session_state['hour_lift_results'] = dayhour_lift_results
+        st.session_state['hour_top10'] = dayhour_top10
+        st.session_state['hour_ratio_results'] = dayhour_ratio_results
+        st.session_state['hour_ratio_top10'] = dayhour_ratio_top10
+
+        hour_ratio_results = dayhour_ratio_results
+        hour_top10 = dayhour_top10
 
     # 从缓存恢复后也需要显示指标卡
     if has_cache and not analyze_btn:
@@ -925,157 +948,89 @@ def main():
                 st.plotly_chart(comp_fig, use_container_width=True)
                 st.markdown("---")
 
-    # ── Tab 4: 时间小时特征聚集度排行榜 ──
+    # ── Tab 4: 时间日期 Fail 占比排行 ──
     with tab4:
-        if not hour_lift_results:
+        if not hour_ratio_results:
             st.info("未发现时间类特征或时间数据不足，无法计算小时级聚集度。")
         else:
-            st.caption("将时间类制程因素的时分秒按小时(0-23)聚合后计算 Lift / Fail内占比，识别 Fail 集中在哪些小时时段。")
+            st.caption("将时间类制程因素按日期+小时(MM-DD HH:00)聚合，展示每道工序在哪天哪个时段 Fail 高度集中。")
 
-            sub_tab_lift, sub_tab_ratio = st.tabs(["⏰ 小时 Lift 排行", "⏰ 小时 Fail 占比排行"])
+            ratio_filtered = [r for r in hour_ratio_results if r['fail_ratio'] > 0.05] if hour_ratio_results else []
+            top10_all = sorted(ratio_filtered, key=lambda x: x['fail_ratio'], reverse=True)[:10]
 
-            with sub_tab_lift:
-                df_hour = pd.DataFrame(hour_top10)
-                df_hour['label'] = df_hour.apply(
-                    lambda r: f"{r['feature'].replace('_Hour','')[:45]} → {r['value']}时", axis=1
+            if not top10_all:
+                st.warning("无时间类 Fail 内占比数据可用于展示。")
+            else:
+                df_plot = pd.DataFrame(top10_all)
+                df_plot['label'] = df_plot.apply(
+                    lambda r: f"{r['feature'].replace('_DayHour','')[-35:]} · {r['value']}", axis=1
                 )
-                df_hour = df_hour.sort_values('lift', ascending=True)
+                df_plot = df_plot.sort_values('fail_ratio', ascending=True)
 
-                hour_fig = go.Figure()
-                hour_fig.add_trace(go.Bar(
-                    y=df_hour['label'],
-                    x=df_hour['lift'],
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    y=df_plot['label'],
+                    x=df_plot['fail_ratio'] * 100,
                     orientation='h',
                     marker=dict(
-                        color=df_hour['lift'],
+                        color=df_plot['fail_ratio'],
                         colorscale='Tealgrn',
                         showscale=True,
-                        colorbar=dict(title='Lift')
+                        colorbar=dict(title='Fail占比')
                     ),
-                    text=df_hour.apply(
-                        lambda r: f"Lift={r['lift']:.2f} | Fail#{r['fail_count']}",
+                    text=df_plot.apply(
+                        lambda r: f"{r['fail_ratio']*100:.1f}%",
                         axis=1
                     ),
                     textposition='outside',
                     textfont=dict(size=11),
                     hovertemplate=(
                         '<b>工序</b>: %{customdata[0]}<br>'
-                        '<b>小时</b>: %{customdata[1]}时<br>'
-                        '<b>Lift</b>: %{x:.2f}<br>'
+                        '<b>时间</b>: %{customdata[1]}<br>'
+                        '<b>Fail内占比</b>: %{y:.2f}%<br>'
                         '<b>Fail次数</b>: %{customdata[2]}<br>'
                         '<b>基准次数</b>: %{customdata[3]}<br>'
-                        '<b>Fail集中度</b>: %{customdata[4]:.2%}<br>'
-                        '<b>基准占比</b>: %{customdata[5]:.2%}<br>'
                         '<extra></extra>'
                     ),
-                    customdata=df_hour[['feature', 'value', 'fail_count', 'base_count', 'p_fail', 'p_base']].values
+                    customdata=df_plot[['feature', 'value', 'fail_count', 'base_count']].values
                 ))
 
-                hour_fig.add_vline(
-                    x=1.0, line_dash="dash", line_color="gray",
-                    annotation_text="Lift=1.0 基准线", annotation_position="top"
-                )
-
-                hour_fig.update_layout(
-                    title='时间类工序特征按小时聚集度 TOP',
-                    xaxis_title='Lift（提升度 → 越高越异常）',
-                    yaxis=dict(title='', tickfont=dict(size=10)),
+                fig.update_layout(
+                    title='时间类工序 Fail 占比 TOP（按时间排序）',
+                    xaxis=dict(
+                        title='Fail 内占比 (%)',
+                        tickfont=dict(size=10)
+                    ),
+                    yaxis=dict(
+                        title='',
+                        tickfont=dict(size=9)
+                    ),
                     height=650,
                     margin=dict(l=20, r=120, t=50, b=20),
                     showlegend=False
                 )
 
-                st.plotly_chart(hour_fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True)
 
-                with st.expander("查看完整时间小时特征数据"):
-                    df_hour_display = df_hour.copy()
-                    df_hour_display['工序'] = df_hour_display['feature'].str.replace('_Hour', '')
-                    df_hour_display['小时'] = df_hour_display['value'].apply(lambda x: f"{x}时")
-                    df_hour_display['Fail集中度'] = df_hour_display['p_fail'].apply(lambda x: f"{x*100:.2f}%")
-                    df_hour_display['基准占比'] = df_hour_display['p_base'].apply(lambda x: f"{x*100:.2f}%")
-                    st.dataframe(
-                        df_hour_display[['工序', '小时', 'lift', 'fail_count', 'base_count', 'Fail集中度', '基准占比']].rename(columns={
-                            'lift': 'Lift', 'fail_count': 'Fail次数', 'base_count': '基准次数'
-                        }),
-                        use_container_width=True
-                    )
+                remaining = [r for r in ratio_filtered if r not in top10_all]
+                if remaining:
+                    with st.expander(f"查看其余 Fail 内占比 > 5% 的时序数据（共 {len(remaining)} 条）"):
+                        df_rem = pd.DataFrame(remaining)
+                        df_rem = df_rem.sort_values('value')
+                        df_rem['工序'] = df_rem['feature'].str.replace('_DayHour', '')
+                        df_rem['时间'] = df_rem['value']
+                        st.dataframe(
+                            df_rem[['工序', '时间', 'fail_count', 'fail_ratio']].rename(columns={
+                                'fail_count': 'Fail次数',
+                                'fail_ratio': 'Fail内占比'
+                            }),
+                            use_container_width=True
+                        )
 
                 st.markdown("""
-                **说明**：将时间类制程因素按小时聚合（0-23时），计算每个小时段的 Lift 值。
-                Lift > 1 表示 Fail 产品在该小时段的占比高于基准水平，可能提示该时段存在异常（如换班、设备调试等）。
+                **说明**：将时间类制程因素按日期+小时聚合，统计每个时段 Fail 样本中的占比。横轴按时间顺序排列，
+                纵轴为该时段 Fail 内占比（%）。占比越高说明该时段 Fail 越集中，可结合排班、设备调机等记录排查。
                 """)
-
-            with sub_tab_ratio:
-                ratio_filtered = [r for r in hour_ratio_results if r['fail_ratio'] > 0.05] if hour_ratio_results else []
-                hour_ratio_top10_show = get_top10_by_feature(ratio_filtered, sort_key='fail_ratio') if ratio_filtered else []
-
-                if not hour_ratio_top10_show:
-                    st.warning("无时间类 Fail 内占比数据可用于展示。")
-                else:
-                    df_hour_ratio = pd.DataFrame(hour_ratio_top10_show)
-                    df_hour_ratio['label'] = df_hour_ratio.apply(
-                        lambda r: f"{r['feature'].replace('_Hour','')[:45]} → {r['value']}时", axis=1
-                    )
-                    df_hour_ratio = df_hour_ratio.sort_values('fail_ratio', ascending=True)
-
-                    ratio_fig = go.Figure()
-                    ratio_fig.add_trace(go.Bar(
-                        y=df_hour_ratio['label'],
-                        x=df_hour_ratio['fail_ratio'] * 100,
-                        orientation='h',
-                        marker=dict(
-                            color=df_hour_ratio['fail_ratio'],
-                            colorscale='Tealgrn',
-                            showscale=True,
-                            colorbar=dict(title='Fail占比')
-                        ),
-                        text=df_hour_ratio.apply(
-                            lambda r: f"{r['fail_ratio']*100:.1f}% | Fail#{r['fail_count']}",
-                            axis=1
-                        ),
-                        textposition='outside',
-                        textfont=dict(size=11),
-                        hovertemplate=(
-                            '<b>工序</b>: %{customdata[0]}<br>'
-                            '<b>小时</b>: %{customdata[1]}时<br>'
-                            '<b>Fail内占比</b>: %{x:.2f}%<br>'
-                            '<b>Fail次数</b>: %{customdata[2]}<br>'
-                            '<b>基准次数</b>: %{customdata[3]}<br>'
-                            '<extra></extra>'
-                        ),
-                        customdata=df_hour_ratio[['feature', 'value', 'fail_count', 'base_count']].values
-                    ))
-
-                    ratio_fig.update_layout(
-                        title='时间类工序特征按小时 Fail 内占比 TOP',
-                        xaxis_title='Fail 内占比 (%) → 越高说明该时段在 NG 中越集中',
-                        yaxis=dict(title='', tickfont=dict(size=10)),
-                        height=650,
-                        margin=dict(l=20, r=120, t=50, b=20),
-                        showlegend=False
-                    )
-
-                    st.plotly_chart(ratio_fig, use_container_width=True)
-
-                    remaining = [r for r in ratio_filtered if r['feature'] not in {x['feature'] for x in hour_ratio_top10_show}]
-                    if remaining:
-                        with st.expander(f"查看其余小时 Fail 内占比 > 5% 的特征（共 {len(remaining)} 条）"):
-                            df_rem = pd.DataFrame(remaining)
-                            df_rem = df_rem.sort_values('fail_ratio', ascending=False)
-                            df_rem['工序'] = df_rem['feature'].str.replace('_Hour', '')
-                            df_rem['小时'] = df_rem['value'].apply(lambda x: f"{x}时")
-                            st.dataframe(
-                                df_rem[['工序', '小时', 'fail_count', 'fail_ratio']].rename(columns={
-                                    'fail_count': 'Fail次数',
-                                    'fail_ratio': 'Fail内占比'
-                                }),
-                                use_container_width=True
-                            )
-
-                    st.markdown("""
-                    **说明**：仅统计该小时段在当前 Fail 样本中的占比，不考虑其在整体基准数据中的分布频率。
-                    例如某工序在 14 时的 Fail 占全部 Fail 的 78.6%，说明该时段在 NG 样本中高度集中。
-                    """)
 
     # ═══════════════════════════════════════════════
     # 详细数据表
