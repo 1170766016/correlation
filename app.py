@@ -13,6 +13,8 @@ import numpy as np
 import os
 import json
 import re
+import random
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -66,35 +68,51 @@ def load_dashboard_dict():
 
 @st.cache_data(show_spinner="正在加载数据...", max_entries=2)
 def load_data_from_path(file_path, usecols_tuple, is_excel=False):
-    """从文件路径加载数据（缓存），usecols_tuple 为 tuple 或 None"""
+    """从文件路径加载数据（缓存），支持 CSV, Excel, Parquet"""
     usecols = list(usecols_tuple) if usecols_tuple else None
-    if is_excel:
+    ext = file_path.lower()
+    if is_excel or ext.endswith(('.xlsx', '.xls')):
         picker = (lambda c: c in usecols) if usecols else None
         try:
             return pd.read_excel(file_path, engine="calamine", usecols=picker)
         except (ImportError, ValueError):
             return pd.read_excel(file_path, engine="openpyxl", usecols=picker)
+    elif ext.endswith('.parquet'):
+        return pd.read_parquet(file_path, columns=usecols)
     return pd.read_csv(file_path, usecols=usecols, low_memory=False)
 
 
 def load_data(file_path=None, uploaded_file=None, dashboard_cols=None):
-    """加载数据，优先使用上传文件，其次使用本地默认文件"""
+    """加载数据，优先使用上传文件，其次使用本地默认文件，支持 Parquet"""
     if uploaded_file is not None:
-        if uploaded_file.name.lower().endswith(('.xlsx', '.xls')):
+        name = uploaded_file.name.lower()
+        if name.endswith(('.xlsx', '.xls')):
             try:
                 return pd.read_excel(uploaded_file, engine="calamine")
             except (ImportError, ValueError):
                 return pd.read_excel(uploaded_file, engine="openpyxl")
+        elif name.endswith('.parquet'):
+            return pd.read_parquet(uploaded_file)
         return pd.read_csv(uploaded_file, low_memory=False)
         
     if file_path and os.path.exists(file_path):
-        is_excel = file_path.lower().endswith(('.xlsx', '.xls'))
+        ext = file_path.lower()
+        is_excel = ext.endswith(('.xlsx', '.xls'))
+        is_parquet = ext.endswith('.parquet')
+        
         if dashboard_cols:
             if is_excel:
                 try:
                     file_cols = pd.read_excel(file_path, engine="calamine", nrows=1).columns.tolist()
                 except (ImportError, ValueError):
                     file_cols = pd.read_excel(file_path, engine="openpyxl", nrows=1).columns.tolist()
+            elif is_parquet:
+                # 快速读取 Parquet 列名
+                try:
+                    import pyarrow.parquet as pq
+                    file_cols = pq.read_table(file_path, stop_at_metadata=True).column_names
+                except Exception:
+                    file_cols = pd.read_parquet(file_path).columns.tolist()
             else:
                 file_cols = pd.read_csv(file_path, nrows=0).columns.tolist()
                 
@@ -423,6 +441,26 @@ def extract_dayhour_features(df):
             continue
         try:
             s = df[col]
+            if s.dropna().empty:
+                continue
+                
+            if pd.api.types.is_datetime64_any_dtype(s):
+                dayhour_col = f"{col}_DayHour"
+                df[dayhour_col] = s.dt.strftime("%m-%d %H:00")
+                dayhour_cols.append(dayhour_col)
+                continue
+
+            # 优化：通过正则直接截取标准的 YYYY-MM-DD HH:MM:SS，跳过极慢的 pd.to_datetime 推断
+            s_str = s.astype(str)
+            extracted = s_str.str.extract(r'\d{4}[-/]([0-1]\d[-/][0-3]\d)[ T]([0-2]\d):')
+            valid_ratio = extracted[0].notna().sum() / n
+            if valid_ratio >= 0.3:
+                dayhour_col = f"{col}_DayHour"
+                df[dayhour_col] = extracted[0].str.replace('/', '-') + " " + extracted[1] + ":00"
+                dayhour_cols.append(dayhour_col)
+                continue
+
+            # 回退：非标准格式用 pd.to_datetime 慢速解析
             if str(s.dtype) == "category":
                 s = s.astype(object)
             parsed = pd.to_datetime(s, errors="coerce", cache=True)
@@ -437,14 +475,79 @@ def extract_dayhour_features(df):
     return df, dayhour_cols
 
 
+def generate_mock_data(n=500):
+    random.seed(42)
+    np.random.seed(42)
+    stations = ["METROLOGY", "FUNCTION_TEST", "FGAVI"]
+    modes = ["VA_STICTION_CLOSE2OPEN_MA", "VA_GAINTRIM_VCMSTROKE_DIAMETER_UM", "VA_DRIVER2_AFE_P_VA/CONNECT NG"]
+    machines = [f"MC_{i:03d}" for i in range(1, 16)]
+    bad_mc = "MC_BAD_007"
+    cavities = ["Cav_1", "Cav_2", "Cav_3", "Cav_4"]
+    vendors = ["Vendor_A", "Vendor_B", "Vendor_C"]
+    lots = [f"LOT_{i:04d}" for i in range(2001, 2021)]
+    base_date = datetime(2026, 4, 1)
+    proc_prefixes = [
+        "VCM_M1_FPC_UpCoil_Attach", "VCM_M2_Stator_FPC_Attach",
+        "VCM_M3_BCA_Bending", "VCM_M4_Rotor_Magnet_Attach",
+        "VCM_M5_ShieldCan_Shim_Attach", "VCM_M6_StatorAssy_Grease",
+        "VCM_M7_AgGlue1", "VCM_M8_Aging", "VCM_Function_Test1",
+        "VCM_M9_Cover_Attach", "VCM_M10_Function_test",
+    ]
+    BAD_DAYS = [5, 16]
+    BAD_HOURS = [2, 15]
+    rows = []
+    for i in range(n):
+        is_fail = random.random() < 0.30
+        is_target = is_fail and random.random() < 0.45
+        if is_target:
+            day = random.choice(BAD_DAYS)
+            hour = random.choice(BAD_HOURS)
+        else:
+            day = random.randint(0, 29)
+            hour = random.randint(0, 23)
+        dt = base_date + timedelta(days=day, hours=hour, minutes=random.randint(0, 59))
+        if is_target:
+            station = "METROLOGY"
+            fm = "VA_DRIVER2_AFE_P_VA/CONNECT NG"
+        elif is_fail:
+            station = random.choice(stations)
+            fm = random.choice(modes[:2])
+        else:
+            station = ""
+            fm = ""
+        row = {
+            "sn": f"SN{i:06d}", "Date": dt.strftime("%Y-%m-%d"),
+            "Results": "FAIL" if is_fail else "PASS",
+            "Failed_Station": station, "Failure_Mode": fm,
+        }
+        for pfx in proc_prefixes:
+            mc = bad_mc if is_target and random.random() < 0.9 else random.choice(machines)
+            row[f"{pfx}_MC_ID"] = mc
+            t = dt + timedelta(minutes=random.randint(0, 30))
+            row[f"{pfx}_End_Time"] = t.strftime("%Y-%m-%d %H:%M:%S")
+        row["VCM_Stator_Cavity_ID"] = random.choice(cavities)
+        row["VCM_FPC_Vendor"] = random.choice(vendors)
+        row["VCM_Bending_Glue_lot_ID_1"] = random.choice(lots)
+        row["Project"] = "VA3199"
+        if is_fail:
+            row["VCM_Special_Unit"] = "NG_UNIT_001"
+            row["VCM_Special_Vendor_ID"] = "VENDOR_FIXED"
+        else:
+            row["VCM_Special_Unit"] = random.choice(["UNIT_A", "UNIT_B", "UNIT_C", "UNIT_D"])
+            row["VCM_Special_Vendor_ID"] = random.choice(["VENDOR_X", "VENDOR_Y", "VENDOR_Z"])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def main():
     st.title("终检Fail产品全流程共性聚集度分析")
     st.markdown("基于**提升度 (Lift)** 算法，从全流程 ~500 个离散工序因素中识别导致终检 Fail 的异常聚集特征。")
 
     # ── 侧边栏：数据源 ──
     st.sidebar.header("数据源")
-    uploaded_file = st.sidebar.file_uploader("上传数据文件（可选）", type=["csv", "xlsx", "xls"])
-    use_default = st.sidebar.checkbox("使用本地 PRB_data.csv", value=True)
+    use_mock = st.sidebar.checkbox("使用 Demo 模拟数据", value=False, help="无需上传文件，使用内置模拟数据")
+    uploaded_file = st.sidebar.file_uploader("上传数据文件（可选）", type=["csv", "xlsx", "xls", "parquet"], disabled=use_mock)
+    use_default = st.sidebar.checkbox("使用本地 PRB_data.csv", value=True, disabled=use_mock)
 
     if LLM_API_KEY and LLM_API_KEY != "sk-your-api-key-here":
         available_models = list_available_models(LLM_API_KEY, LLM_API_BASE)
@@ -469,13 +572,19 @@ def main():
     need_reload = False
     if 'df_raw' not in st.session_state:
         need_reload = True
+    if use_mock != st.session_state.get('_use_mock'):
+        need_reload = True
     if uploaded_file is not None and st.session_state.get('uploaded_name') != uploaded_file.name:
         need_reload = True
     if uploaded_file is None and st.session_state.get('uploaded_name') is not None:
         need_reload = True
 
     if need_reload:
-        if uploaded_file is not None:
+        if use_mock:
+            with st.spinner("正在生成 Demo 模拟数据..."):
+                st.session_state['df_raw'] = generate_mock_data()
+            st.session_state['uploaded_name'] = None
+        elif uploaded_file is not None:
             st.session_state['df_raw'] = load_data(uploaded_file=uploaded_file)
             st.session_state['uploaded_name'] = uploaded_file.name
         elif use_default:
@@ -486,6 +595,7 @@ def main():
             st.sidebar.warning("请上传数据文件或勾选使用本地数据")
             st.info("请先在左侧配置数据源。")
             return
+    st.session_state['_use_mock'] = use_mock
 
     df_raw = st.session_state['df_raw']
 
@@ -553,7 +663,7 @@ def main():
         "Lift 权重",
         min_value=0.0,
         max_value=1.0,
-        value=0.3,
+        value=1.0,
         step=0.05,
         help="Lift 在综合评分中的权重，Fail内占比自动占剩余权重"
     )
@@ -617,16 +727,12 @@ def main():
     else:
         # 重新计算
         with st.spinner("正在准备数据..."):
-            df_pass = df_date_filtered[df_date_filtered['Results'] == 'PASS']
             if failed_station != "全部":
-                df_station_all = df_date_filtered[df_date_filtered['Failed_Station'] == failed_station]
+                df_base = df_date_filtered[(df_date_filtered['Results'] == 'PASS') | (df_date_filtered['Failed_Station'] == failed_station)]
+                df_fail = df_date_filtered[(df_date_filtered['Results'] == 'FAIL') & (df_date_filtered['Failed_Station'] == failed_station)]
             else:
-                df_station_all = df_date_filtered
-            df_base = pd.concat([df_pass, df_station_all]).drop_duplicates()
-            df_fail = df_station_filtered = df_date_filtered[
-                (df_date_filtered['Results'] == 'FAIL') if failed_station == "全部"
-                else (df_date_filtered['Results'] == 'FAIL') & (df_date_filtered['Failed_Station'] == failed_station)
-            ]
+                df_base = df_date_filtered
+                df_fail = df_date_filtered[df_date_filtered['Results'] == 'FAIL']
 
             n_base = len(df_base)
             n_fail = len(df_fail)
@@ -669,25 +775,37 @@ def main():
                 df_base, df_fail, all_feature_cols, lift_weight=lift_weight, min_count=3
             )
 
-        lift_progress_text.markdown("正在提取时间小时特征...")
-        time_cols, _, _, _ = classify_columns(df_base)
+        lift_progress_text.markdown("正在提取时间小时特征(仅针对Fail数据)...")
+        time_cols, _, _, _ = classify_columns(df_fail)
+        dayhour_ratio_results = []
+        
         if time_cols:
-            df_base, dayhour_cols = extract_dayhour_features(df_base)
-            df_fail, _ = extract_dayhour_features(df_fail)
+            df_fail, dayhour_cols = extract_dayhour_features(df_fail)
             if dayhour_cols:
-                lift_progress_text.markdown("正在计算时间类提升度（小时）...")
-                dayhour_results, dayhour_ratio_raw, _ = compute_lift(
-                    df_base, df_fail, dayhour_cols, lift_weight=lift_weight, min_count=1
-                )
-                dayhour_lift_results = dayhour_results
-                dayhour_ratio_results = dayhour_ratio_raw
-            else:
-                dayhour_lift_results = []
-        else:
-            dayhour_lift_results = []
-        dayhour_top10 = get_top10_by_feature(dayhour_lift_results) if dayhour_lift_results else []
-        dayhour_ratio_top10 = (get_top10_by_feature(dayhour_ratio_results, sort_key='fail_ratio')
-                               if dayhour_ratio_results else [])
+                lift_progress_text.markdown("正在计算时间类Fail占比（小时）...")
+                for col in dayhour_cols:
+                    fail_series = df_fail[col].dropna()
+                    if len(fail_series) == 0: continue
+                    fail_counts = fail_series.value_counts()
+                    for val, count in fail_counts.items():
+                        val_str = normalize_val(val)
+                        if val_str is None or val_str == '缺失值': continue
+                        fail_ratio = count / n_fail
+                        dayhour_ratio_results.append({
+                            'feature': col,
+                            'value': val_str,
+                            'fail_count': int(count),
+                            'base_count': '-',
+                            'p_fail': float(fail_ratio),
+                            'p_base': 0.0,
+                            'fail_ratio': float(fail_ratio),
+                            'lift': '-',
+                            'composite_score': float(fail_ratio)
+                        })
+        
+        dayhour_lift_results = []
+        dayhour_ratio_top10 = get_top10_by_feature(dayhour_ratio_results, sort_key='fail_ratio') if dayhour_ratio_results else []
+        dayhour_top10 = dayhour_ratio_top10
 
         lift_progress.progress(1.0)
         lift_progress_text.markdown("分析完成!")
@@ -787,9 +905,9 @@ def main():
         bar_fig.update_layout(
             title='TOP 10 离散工序因素 Fail 聚集度（Lift）',
             xaxis_title='Lift（提升度 → 越高越异常）',
-            yaxis=dict(title='', tickfont=dict(size=10)),
+            yaxis=dict(title='', tickfont=dict(size=10), automargin=True),
             height=650,
-            margin=dict(l=20, r=120, t=50, b=20),
+            margin=dict(r=120, t=50, b=20),
             showlegend=False
         )
 
@@ -840,9 +958,9 @@ def main():
             ratio_fig.update_layout(
                 title='TOP 10 特征取值在 Fail 样本内的占比（不考虑基准频率）',
                 xaxis_title='Fail 内占比 (%) → 越高说明该取值在 NG 中越集中',
-                yaxis=dict(title='', tickfont=dict(size=10)),
+                yaxis=dict(title='', tickfont=dict(size=10), automargin=True),
                 height=650,
-                margin=dict(l=20, r=120, t=50, b=20),
+                margin=dict(r=120, t=50, b=20),
                 showlegend=False
             )
 
@@ -885,11 +1003,20 @@ def main():
 
                 st.markdown(f"**TOP{rank+1}**: `{feat}` (Lift={lift_val})")
 
-                # 向量化：用 value_counts 一次性计算，避免逐值循环
-                base_vc = df_base[feat].apply(normalize_val).value_counts()
-                fail_vc = df_fail[feat].apply(normalize_val).value_counts()
+                # 优化：先聚类计数，再对少数唯一值进行 normalize，避免对全量数据逐行 apply
+                def get_normalized_vc(series):
+                    vc = series.value_counts(dropna=False)
+                    norm_dict = {}
+                    for k, v in vc.items():
+                        nk = normalize_val(k)
+                        if nk is not None:
+                            norm_dict[nk] = norm_dict.get(nk, 0) + v
+                    return pd.Series(norm_dict) if norm_dict else pd.Series(dtype=int)
 
-                top_vals = base_vc.head(20).index.tolist()
+                base_vc = get_normalized_vc(df_base[feat])
+                fail_vc = get_normalized_vc(df_fail[feat])
+
+                top_vals = base_vc.sort_values(ascending=False).head(20).index.tolist()
                 if val not in top_vals:
                     top_vals.insert(0, val)
 
@@ -987,12 +1114,11 @@ def main():
                     hovertemplate=(
                         '<b>工序</b>: %{customdata[0]}<br>'
                         '<b>时间</b>: %{customdata[1]}<br>'
-                        '<b>Fail内占比</b>: %{y:.2f}%<br>'
+                        '<b>Fail内占比</b>: %{x:.2f}%<br>'
                         '<b>Fail次数</b>: %{customdata[2]}<br>'
-                        '<b>基准次数</b>: %{customdata[3]}<br>'
                         '<extra></extra>'
                     ),
-                    customdata=df_plot[['feature', 'value', 'fail_count', 'base_count']].values
+                    customdata=df_plot[['feature', 'value', 'fail_count']].values
                 ))
 
                 fig.update_layout(
@@ -1003,10 +1129,11 @@ def main():
                     ),
                     yaxis=dict(
                         title='',
-                        tickfont=dict(size=9)
+                        tickfont=dict(size=9),
+                        automargin=True
                     ),
                     height=650,
-                    margin=dict(l=20, r=120, t=50, b=20),
+                    margin=dict(r=120, t=50, b=20),
                     showlegend=False
                 )
 
@@ -1016,7 +1143,7 @@ def main():
                 if remaining:
                     with st.expander(f"查看其余 Fail 内占比 > 5% 的时序数据（共 {len(remaining)} 条）"):
                         df_rem = pd.DataFrame(remaining)
-                        df_rem = df_rem.sort_values('value')
+                        df_rem = df_rem.sort_values('value').reset_index(drop=True)
                         df_rem['工序'] = df_rem['feature'].str.replace('_DayHour', '')
                         df_rem['时间'] = df_rem['value']
                         st.dataframe(
@@ -1024,7 +1151,8 @@ def main():
                                 'fail_count': 'Fail次数',
                                 'fail_ratio': 'Fail内占比'
                             }),
-                            use_container_width=True
+                            use_container_width=True,
+                            hide_index=True
                         )
 
                 st.markdown("""
@@ -1052,7 +1180,8 @@ def main():
             'fail_count': 'Fail次数', 'base_count': '基准次数',
             'composite_score': f'综合评分(Lift{lift_weight:.0%}+Fail{fail_ratio_weight:.0%})'
         }),
-        use_container_width=True
+        use_container_width=True,
+        hide_index=True
     )
 
     with st.expander("查看全部 Lift > 1.0 的聚集特征"):
@@ -1069,7 +1198,8 @@ def main():
                     'fail_count': 'Fail次数', 'base_count': '基准次数',
                     'composite_score': f'综合评分(Lift{lift_weight:.0%}+Fail{fail_ratio_weight:.0%})'
                 }),
-                use_container_width=True
+                use_container_width=True,
+                hide_index=True
             )
         else:
             st.write("无额外 Lift > 1.0 的特征")
@@ -1084,7 +1214,8 @@ def main():
             df_fail_one[['feature', 'value', 'fail_count', 'Fail内占比']].rename(columns={
                 'feature': '特征列', 'value': '聚集取值', 'fail_count': 'Fail次数'
             }),
-            use_container_width=True
+            use_container_width=True,
+            hide_index=True
         )
         st.markdown("""
         **说明**：以上特征在当前 Fail 样本中只有一个唯一取值（100%集中），
