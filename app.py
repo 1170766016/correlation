@@ -14,14 +14,26 @@ import os
 import json
 import re
 import random
+import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from scipy.stats import fisher_exact, chi2_contingency
+
+logger = logging.getLogger(__name__)
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 st.set_page_config(page_title="终检Fail共性聚集度分析", layout="wide")
 
-DATA_PATH = os.path.join(os.path.dirname(__file__), "PRB_data.csv")
+def get_default_data_path():
+    base_dir = os.path.dirname(__file__)
+    for ext in ['.parquet', '.csv', '.xlsx', '.xls']:
+        path = os.path.join(base_dir, f"PRB_data{ext}")
+        if os.path.exists(path):
+            return path
+    return os.path.join(base_dir, "PRB_data.csv")
+
+DATA_PATH = get_default_data_path()
 DASHBOARD_PATH = os.path.join(os.path.dirname(__file__), "dashboard F11.xlsx")
 
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
@@ -48,7 +60,7 @@ def normalize_val(v):
 
 
 @st.cache_data(show_spinner=False, max_entries=1)
-def load_dashboard_dict():
+def load_dashboard_dict(mtime=None):
     """从 dashboard F11.xlsx 读取列名和含义映射"""
     if os.path.exists(DASHBOARD_PATH):
         try:
@@ -61,13 +73,13 @@ def load_dashboard_dict():
                 if col and desc:
                     desc_map[col] = desc
             return col_names, desc_map
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("加载 dashboard 字典失败: %s", e)
     return None, {}
 
 
 @st.cache_data(show_spinner="正在加载数据...", max_entries=2)
-def load_data_from_path(file_path, usecols_tuple, is_excel=False):
+def load_data_from_path(file_path, usecols_tuple, is_excel=False, mtime=None):
     """从文件路径加载数据（缓存），支持 CSV, Excel, Parquet"""
     usecols = list(usecols_tuple) if usecols_tuple else None
     ext = file_path.lower()
@@ -75,7 +87,8 @@ def load_data_from_path(file_path, usecols_tuple, is_excel=False):
         picker = (lambda c: c in usecols) if usecols else None
         try:
             return pd.read_excel(file_path, engine="calamine", usecols=picker)
-        except (ImportError, ValueError):
+        except (ImportError, ValueError) as e:
+            logger.debug("calamine 引擎不可用，回退至 openpyxl: %s", e)
             return pd.read_excel(file_path, engine="openpyxl", usecols=picker)
     elif ext.endswith('.parquet'):
         return pd.read_parquet(file_path, columns=usecols)
@@ -89,7 +102,8 @@ def load_data(file_path=None, uploaded_file=None, dashboard_cols=None):
         if name.endswith(('.xlsx', '.xls')):
             try:
                 return pd.read_excel(uploaded_file, engine="calamine")
-            except (ImportError, ValueError):
+            except (ImportError, ValueError) as e:
+                logger.debug("上传文件 calamine 引擎不可用，回退至 openpyxl: %s", e)
                 return pd.read_excel(uploaded_file, engine="openpyxl")
         elif name.endswith('.parquet'):
             return pd.read_parquet(uploaded_file)
@@ -103,15 +117,17 @@ def load_data(file_path=None, uploaded_file=None, dashboard_cols=None):
         if dashboard_cols:
             if is_excel:
                 try:
-                    file_cols = pd.read_excel(file_path, engine="calamine", nrows=1).columns.tolist()
-                except (ImportError, ValueError):
                     file_cols = pd.read_excel(file_path, engine="openpyxl", nrows=1).columns.tolist()
+                except Exception as e:
+                    logger.warning("openpyxl 读取列名失败，使用默认引擎: %s", e)
+                    file_cols = pd.read_excel(file_path, nrows=1).columns.tolist()
             elif is_parquet:
                 # 快速读取 Parquet 列名
                 try:
                     import pyarrow.parquet as pq
-                    file_cols = pq.read_table(file_path, stop_at_metadata=True).column_names
-                except Exception:
+                    file_cols = pq.read_schema(file_path).names
+                except Exception as e:
+                    logger.warning("pyarrow 读取 Parquet schema 失败，回退至 pandas（将加载全量数据）: %s", e)
                     file_cols = pd.read_parquet(file_path).columns.tolist()
             else:
                 file_cols = pd.read_csv(file_path, nrows=0).columns.tolist()
@@ -121,8 +137,8 @@ def load_data(file_path=None, uploaded_file=None, dashboard_cols=None):
             for c in use_cols_extra:
                 if c not in use_cols:
                     use_cols.append(c)
-            return load_data_from_path(file_path, tuple(use_cols), is_excel=is_excel)
-        return load_data_from_path(file_path, None, is_excel=is_excel)
+            return load_data_from_path(file_path, tuple(use_cols), is_excel=is_excel, mtime=os.path.getmtime(file_path))
+        return load_data_from_path(file_path, None, is_excel=is_excel, mtime=os.path.getmtime(file_path))
     return None
 
 
@@ -159,22 +175,21 @@ def classify_columns(df):
 def compute_lift(df_base, df_fail, feature_cols, lift_weight=0.3, min_count=3, max_unique_ratio=0.3):
     """
     计算每个离散特征取值的提升度(Lift) — 向量化版本
-    跳过唯一值过多的列、时间戳列、常量列
-    返回：(lift_results, ratio_results, fail_one_results)
+    采用混合显著性检验：大样本用卡方(Chi-Squared)，小样本用 Fisher
     """
     n_base = len(df_base)
     n_fail = len(df_fail)
+    n_pass = n_base - n_fail
 
     if n_fail == 0 or n_base == 0:
         return [], [], []
 
     max_unique = max(1000, int(n_base * max_unique_ratio))
-    lift_results = []
+    lift_candidates = []  # 先收集所有候选，循环结束后统一做 BH-FDR 校正
     ratio_results = []
-    fail_one_results = []
+    fail_one_candidates = []
 
     time_pattern = re.compile(r'_Start_Time$|_End_Time$|_datetime$', re.IGNORECASE)
-
     total_cols = len(feature_cols)
     fail_ratio_weight = 1.0 - lift_weight
 
@@ -184,10 +199,10 @@ def compute_lift(df_base, df_fail, feature_cols, lift_weight=0.3, min_count=3, m
             try:
                 st.session_state['lift_progress'].progress(pct)
                 st.session_state['lift_progress_text'].markdown(
-                    f"计算提升度... ({idx}/{total_cols})"
+                    f"计算提升度 & 混合显著性检验... ({idx}/{total_cols})"
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("进度条更新失败（可忽略）: %s", e)
 
         if col not in df_fail.columns:
             continue
@@ -199,47 +214,30 @@ def compute_lift(df_base, df_fail, feature_cols, lift_weight=0.3, min_count=3, m
         fail_series = df_fail[col]
 
         base_nunique = base_series.nunique(dropna=True)
-        fail_nunique = fail_series.nunique(dropna=True)
-        if base_nunique > max_unique:
-            continue
-        if base_nunique <= 1:
+        if base_nunique > max_unique or base_nunique <= 1:
             continue
 
-        if fail_nunique == 1:
-            val = fail_series.dropna().iloc[0] if fail_series.dropna().shape[0] > 0 else None
-            val_str = normalize_val(val) or '缺失值'
-            fail_one_results.append({
-                'feature': col,
-                'value': val_str,
-                'fail_count': int(n_fail),
-                'fail_ratio': 1.0
-            })
+        # 使用归一化计数，确保 1.0 和 1 等格式被正确合并
+        base_counts = get_normalized_vc(base_series)
+        fail_counts = get_normalized_vc(fail_series)
+
+        if fail_counts.empty:
             continue
 
-        # 向量化：一次性计算所有取值的 lift
-        base_counts = base_series.value_counts(dropna=False)
-        fail_counts = fail_series.value_counts(dropna=False)
-
-        # 对齐索引
         all_vals = fail_counts.index
         base_aligned = base_counts.reindex(all_vals, fill_value=0)
 
-        # 向量化计算
         fail_cnts = fail_counts.values
         base_cnts = base_aligned.values
+        
         p_fail_arr = fail_cnts / n_fail
         p_base_arr = base_cnts / n_base
 
-        # 掩码：满足最小计数、基准>0、非缺失值
-        mask = (fail_cnts >= min_count) & (base_cnts > 0)
-
         for i, val in enumerate(all_vals):
-            if not mask[i]:
+            if base_cnts[i] <= 0:
                 continue
 
-            val_str = normalize_val(val)
-            if val_str is None or val_str == '缺失值':
-                continue
+            val_str = val # 已经是归一化后的字符串
             if len(val_str) > 200:
                 val_str = val_str[:197] + '...'
 
@@ -247,29 +245,54 @@ def compute_lift(df_base, df_fail, feature_cols, lift_weight=0.3, min_count=3, m
             fail_ratio = p_fail_arr[i]
             composite_score = lift_weight * lift + fail_ratio_weight * (fail_ratio * 100)
 
-            if lift > 1.0:
-                lift_results.append({
-                    'feature': col,
-                    'value': val_str,
-                    'fail_count': int(fail_cnts[i]),
-                    'base_count': int(base_cnts[i]),
-                    'p_fail': round(float(p_fail_arr[i]), 6),
-                    'p_base': round(float(p_base_arr[i]), 6),
-                    'lift': round(float(lift), 4),
-                    'fail_ratio': round(float(fail_ratio), 4),
-                    'composite_score': round(float(composite_score), 4)
-                })
+            # 准备 2x2 列联表
+            a = int(fail_cnts[i])
+            b = int(n_fail - a)
+            c = int(base_cnts[i] - a)
+            d = int(n_pass - c)
+            c = max(0, c); d = max(0, d)
+            
+            table = [[a, b], [c, d]]
 
-            ratio_results.append({
+            # 混合检验策略：
+            # 如果样本量很大 (N > 1000) 且每个单元格数值都较多 (>5)，使用卡方检验以提升速度
+            # 否则使用 Fisher 精确检验保证小样本准确性
+            if n_base > 1000 and a > 5 and b > 5 and c > 5 and d > 5:
+                try:
+                    _, p_val, _, _ = chi2_contingency(table)
+                except Exception:
+                    _, p_val = fisher_exact(table, alternative='greater')
+            else:
+                _, p_val = fisher_exact(table, alternative='greater')
+
+            result_item = {
                 'feature': col,
                 'value': val_str,
-                'fail_count': int(fail_cnts[i]),
+                'fail_count': a,
                 'base_count': int(base_cnts[i]),
                 'p_fail': round(float(p_fail_arr[i]), 6),
                 'p_base': round(float(p_base_arr[i]), 6),
+                'lift': round(float(lift), 4),
                 'fail_ratio': round(float(fail_ratio), 4),
-                'composite_score': round(float(composite_score), 4)
-            })
+                'composite_score': round(float(composite_score), 4),
+                'p_value': round(float(p_val), 6)
+            }
+
+            if a >= min_count and lift > 1.0:
+                lift_candidates.append(result_item)
+
+            if fail_series.nunique(dropna=True) == 1:
+                fail_one_candidates.append(result_item)
+
+            if a >= 1:
+                ratio_results.append(result_item)
+
+    # BH-FDR 多重检验校正：统一对所有候选的 p-value 做校正，避免假阳性泛滥
+    lift_results = _apply_bh_fdr(lift_candidates, alpha=0.05)
+
+    # Fail 内唯一值=1 的特征：排除已在显著结果中的
+    sig_features = {r['feature'] for r in lift_results}
+    fail_one_results = [r for r in fail_one_candidates if r['feature'] not in sig_features]
 
     lift_results.sort(key=lambda x: x['composite_score'], reverse=True)
     ratio_results.sort(key=lambda x: x['fail_ratio'], reverse=True)
@@ -287,7 +310,40 @@ def get_top10_by_feature(results, sort_key='composite_score'):
     return sorted_best[:10]
 
 
+def get_normalized_vc(series):
+    """对 Series 做 value_counts 并归一化 key（整型/浮点合并），返回 {归一化值: 计数}"""
+    vc = series.value_counts(dropna=False)
+    norm_dict = {}
+    for k, v in vc.items():
+        nk = normalize_val(k)
+        if nk is not None:
+            norm_dict[nk] = norm_dict.get(nk, 0) + v
+    return pd.Series(norm_dict) if norm_dict else pd.Series(dtype=int)
 
+
+def _apply_bh_fdr(candidates, alpha=0.05):
+    """应用 Benjamini-Hochberg FDR 校正，返回显著的结果列表（带校正后 p 值）
+    解决多重检验假阳性问题：数百特征×数十取值=数千次检验，需要校正
+    """
+    if not candidates:
+        return []
+    n = len(candidates)
+    # 按 p-value 升序排列
+    sorted_cands = sorted(candidates, key=lambda x: x['p_value'])
+    # 计算校正后 p 值 (step-up procedure)
+    adjusted = [0.0] * n
+    adjusted[-1] = min(sorted_cands[-1]['p_value'], 1.0)
+    for i in range(n - 2, -1, -1):
+        raw_adj = sorted_cands[i]['p_value'] * n / (i + 1)
+        adjusted[i] = min(raw_adj, adjusted[i + 1], 1.0)
+    # 添加校正后 p 值并筛选
+    significant = []
+    for i, r in enumerate(sorted_cands):
+        r['p_value_adjusted'] = round(adjusted[i], 6)
+        if adjusted[i] <= alpha:
+            significant.append(r)
+    logger.info("BH-FDR 校正: %d 个候选中 %d 个通过 (alpha=%.2f)", n, len(significant), alpha)
+    return significant
 
 
 def list_available_models(api_key, api_base):
@@ -408,7 +464,8 @@ def call_llm(api_key, api_base, model, top10_data, desc_map, failed_station, fai
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
                 "chat_template_kwargs": {"enable_thinking": False},
-            }
+            },
+            timeout=90
         )
         if response.status_code == 200:
             return response.json()['choices'][0]['message']['content']
@@ -421,9 +478,9 @@ def call_llm(api_key, api_base, model, top10_data, desc_map, failed_station, fai
         return f"LLM调用异常: {str(e)[:300]}"
 
 
-def _get_cache_key(start_date, end_date, failed_station, lift_weight):
+def _get_cache_key(start_date, end_date, failed_station, failure_mode, lift_weight):
     """生成计算结果的缓存键"""
-    return f"{start_date}_{end_date}_{failed_station}_{lift_weight}"
+    return f"{start_date}_{end_date}_{failed_station}_{failure_mode}_{lift_weight}"
 
 
 def extract_dayhour_features(df):
@@ -470,7 +527,8 @@ def extract_dayhour_features(df):
             dayhour_col = f"{col}_DayHour"
             df[dayhour_col] = parsed.dt.strftime("%m-%d %H:00")
             dayhour_cols.append(dayhour_col)
-        except Exception:
+        except Exception as e:
+            logger.warning("时间列 '%s' 解析失败: %s", col, e)
             continue
     return df, dayhour_cols
 
@@ -547,7 +605,8 @@ def main():
     st.sidebar.header("数据源")
     use_mock = st.sidebar.checkbox("使用 Demo 模拟数据", value=False, help="无需上传文件，使用内置模拟数据")
     uploaded_file = st.sidebar.file_uploader("上传数据文件（可选）", type=["csv", "xlsx", "xls", "parquet"], disabled=use_mock)
-    use_default = st.sidebar.checkbox("使用本地 PRB_data.csv", value=True, disabled=use_mock)
+    data_filename = os.path.basename(DATA_PATH)
+    use_default = st.sidebar.checkbox(f"使用本地 {data_filename}", value=True, disabled=use_mock)
 
     if LLM_API_KEY and LLM_API_KEY != "sk-your-api-key-here":
         available_models = list_available_models(LLM_API_KEY, LLM_API_BASE)
@@ -563,7 +622,8 @@ def main():
             st.sidebar.warning(f"LLM: {LLM_MODEL} (无法获取模型列表)")
 
     # ── 数据加载（缓存到 session_state） ──
-    dashboard_cols, desc_map = load_dashboard_dict()
+    dash_mtime = os.path.getmtime(DASHBOARD_PATH) if os.path.exists(DASHBOARD_PATH) else None
+    dashboard_cols, desc_map = load_dashboard_dict(dash_mtime)
 
     if dashboard_cols:
         st.sidebar.caption(f"Dashboard 特征列: {len(dashboard_cols)} 列")
@@ -580,6 +640,12 @@ def main():
         need_reload = True
 
     if need_reload:
+        for k in ['lift_results', 'ratio_results', 'fail_one_results', 'top10',
+                  'tab3_chart_data', 'n_base', 'n_fail', 'all_feature_cols',
+                  'hour_lift_results', 'hour_top10', 'hour_ratio_results', 'hour_ratio_top10',
+                  'date_col_converted', 'last_cache_key']:
+            st.session_state.pop(k, None)
+            
         if use_mock:
             with st.spinner("正在生成 Demo 模拟数据..."):
                 st.session_state['df_raw'] = generate_mock_data()
@@ -679,19 +745,28 @@ def main():
         return
 
     station_values = df_date_filtered['Failed_Station'].dropna().unique()
-    station_options = ["全部"] + sorted(station_values.tolist())
+    station_options = ["全部"] + sorted([v for v in station_values.tolist() if str(v).strip()])
     failed_station = st.sidebar.selectbox("Failed_Station", station_options, index=0)
+
+    mode_options = ["全部"]
+    if failed_station != "全部":
+        modes = df_date_filtered[df_date_filtered['Failed_Station'] == failed_station]['Failure_Mode'].dropna().unique()
+    else:
+        modes = df_date_filtered['Failure_Mode'].dropna().unique()
+    mode_options += sorted([v for v in modes.tolist() if str(v).strip()])
+    
+    selected_modes = st.sidebar.multiselect("Failure_Mode", mode_options, default=["全部"])
 
     # ── 开始分析按钮 ──
     analyze_btn = st.sidebar.button("开始分析", type="primary", use_container_width=True)
 
     # 生成缓存键
-    cache_key = _get_cache_key(start_date, end_date, failed_station, lift_weight)
+    cache_key = _get_cache_key(start_date, end_date, failed_station, str(selected_modes), lift_weight)
 
     # 如果参数变化，清除旧缓存
     if st.session_state.get('last_cache_key') != cache_key:
         for k in ['lift_results', 'ratio_results', 'fail_one_results', 'top10',
-                   'df_base', 'df_fail', 'n_base', 'n_fail', 'all_feature_cols',
+                   'tab3_chart_data', 'n_base', 'n_fail', 'all_feature_cols',
                    'hour_lift_results', 'hour_top10', 'hour_ratio_results', 'hour_ratio_top10']:
             st.session_state.pop(k, None)
         st.session_state['last_cache_key'] = cache_key
@@ -715,8 +790,7 @@ def main():
         ratio_results = st.session_state['ratio_results']
         fail_one_results = st.session_state['fail_one_results']
         top10 = st.session_state['top10']
-        df_base = st.session_state['df_base']
-        df_fail = st.session_state['df_fail']
+        tab3_chart_data = st.session_state.get('tab3_chart_data', {})
         n_base = st.session_state['n_base']
         n_fail = st.session_state['n_fail']
         all_feature_cols = st.session_state['all_feature_cols']
@@ -727,12 +801,16 @@ def main():
     else:
         # 重新计算
         with st.spinner("正在准备数据..."):
+            # 基准数据组：始终使用全量数据（PASS + 所有 FAIL），确保 Lift 分母准确
+            df_base = df_date_filtered
+
+            # Fail 目标组
+            df_fail = df_date_filtered[df_date_filtered['Results'] == 'FAIL']
             if failed_station != "全部":
-                df_base = df_date_filtered[(df_date_filtered['Results'] == 'PASS') | (df_date_filtered['Failed_Station'] == failed_station)]
-                df_fail = df_date_filtered[(df_date_filtered['Results'] == 'FAIL') & (df_date_filtered['Failed_Station'] == failed_station)]
-            else:
-                df_base = df_date_filtered
-                df_fail = df_date_filtered[df_date_filtered['Results'] == 'FAIL']
+                df_fail = df_fail[df_fail['Failed_Station'] == failed_station]
+            
+            if "全部" not in selected_modes:
+                df_fail = df_fail[df_fail['Failure_Mode'].isin(selected_modes)]
 
             n_base = len(df_base)
             n_fail = len(df_fail)
@@ -741,13 +819,11 @@ def main():
             st.error("## 无Fail数据\n当前筛选条件下 Fail 产品数量为 0，请调整筛选条件。")
             return
 
-        fail_rate = n_fail / n_base * 100
-
         # 概览指标卡
         col1, col2, col3 = st.columns(3)
         col1.metric("基准总数", f"{n_base:,}")
         col2.metric("Fail数量", f"{n_fail:,}")
-        col3.metric("Fail率", f"{fail_rate:.2f}%")
+        col3.metric("Fail率", f"{(n_fail / n_base * 100):.2f}%")
 
         if dashboard_cols:
             all_feature_cols = [c for c in dashboard_cols if c in df_base.columns and c not in SKIP_COLS]
@@ -812,13 +888,22 @@ def main():
 
         top10 = get_top10_by_feature(lift_results)
 
-        # 缓存到 session_state
+        # 预计算 Tab 3 图表数据（仅存储轻量的 value_counts，避免缓存完整 DataFrame）
+        tab3_chart_data = {}
+        for item in top10[:5]:
+            feat = item['feature']
+            if feat in df_base.columns:
+                tab3_chart_data[feat] = {
+                    'base_vc': get_normalized_vc(df_base[feat]),
+                    'fail_vc': get_normalized_vc(df_fail[feat]),
+                }
+
+        # 缓存到 session_state（不缓存 df_base/df_fail 以节省内存）
         st.session_state['lift_results'] = lift_results
         st.session_state['ratio_results'] = ratio_results
         st.session_state['fail_one_results'] = fail_one_results
         st.session_state['top10'] = top10
-        st.session_state['df_base'] = df_base
-        st.session_state['df_fail'] = df_fail
+        st.session_state['tab3_chart_data'] = tab3_chart_data
         st.session_state['n_base'] = n_base
         st.session_state['n_fail'] = n_fail
         st.session_state['all_feature_cols'] = all_feature_cols
@@ -832,13 +917,13 @@ def main():
 
     # 从缓存恢复后也需要显示指标卡
     if has_cache and not analyze_btn:
-        fail_rate = n_fail / n_base * 100
+        fail_rate = (n_fail / n_base * 100) if n_base > 0 else 0.0
         col1, col2, col3 = st.columns(3)
         col1.metric("基准总数", f"{n_base:,}")
         col2.metric("Fail数量", f"{n_fail:,}")
         col3.metric("Fail率", f"{fail_rate:.2f}%")
 
-    st.success(f"共发现 **{len(lift_results)}** 条聚集特征（Lift > 1.0 且 Fail 出现 ≥ 3 次）")
+    st.success(f"共发现 **{len(lift_results)}** 条统计显著的聚集特征（BH-FDR 校正后 p < 0.05 且 Lift > 1.0）")
     st.info(f"每个特征取综合评分最高代表 → **TOP {len(top10)}** 特征")
 
     # ═══════════════════════════════════════════════
@@ -849,8 +934,7 @@ def main():
     st.subheader("可视化分析")
 
     if len(top10) == 0:
-        st.warning("未发现显著的聚集特征（所有 Lift 值均 ≤ 1.0）。")
-        return
+        st.warning("Fail 样本较少，未发现显著的 Lift 聚集特征（Lift <= 1.0 或 Fail 出现次数 < 3）。下方仍展示 Fail 内占比分析。")
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "📈 共性聚集度排行榜(Lift)",
@@ -861,65 +945,69 @@ def main():
 
     # ── Tab 1: TOP 10 水平条形图 ──
     with tab1:
-        df_chart = pd.DataFrame(top10)
-        df_chart['label'] = df_chart.apply(
-            lambda r: f"{r['feature'][:55]} → {r['value']}", axis=1
-        )
-        df_chart = df_chart.sort_values('lift', ascending=True)
+        if len(top10) == 0:
+            st.info("当前筛选条件下 Fail 样本过少，无法计算有效的 Lift 聚集度。请尝试选择 Fail 数量更多的 Station 或选择「全部」。")
+        else:
+            df_chart = pd.DataFrame(top10)
+            df_chart['label'] = df_chart.apply(
+                lambda r: f"{r['feature'][:55]} -> {r['value']}", axis=1
+            )
+            df_chart = df_chart.sort_values('lift', ascending=True)
 
-        bar_fig = go.Figure()
-        bar_fig.add_trace(go.Bar(
-            y=df_chart['label'],
-            x=df_chart['lift'],
-            orientation='h',
-            marker=dict(
-                color=df_chart['lift'],
-                colorscale='Reds',
-                showscale=True,
-                colorbar=dict(title='Lift')
-            ),
-            text=df_chart.apply(
-                lambda r: f"Lift={r['lift']:.1f} | Fail#{r['fail_count']}",
-                axis=1
-            ),
-            textposition='outside',
-            textfont=dict(size=11),
-            hovertemplate=(
-                '<b>特征列</b>: %{customdata[0]}<br>'
-                '<b>聚集取值</b>: %{customdata[1]}<br>'
-                '<b>Lift</b>: %{x:.2f}<br>'
-                '<b>Fail次数</b>: %{customdata[2]}<br>'
-                '<b>基准次数</b>: %{customdata[3]}<br>'
-                '<b>Fail集中度</b>: %{customdata[4]:.2%}<br>'
-                '<b>基准占比</b>: %{customdata[5]:.2%}<br>'
-                '<extra></extra>'
-            ),
-            customdata=df_chart[['feature', 'value', 'fail_count', 'base_count', 'p_fail', 'p_base']].values
-        ))
+            bar_fig = go.Figure()
+            bar_fig.add_trace(go.Bar(
+                y=df_chart['label'],
+                x=df_chart['lift'],
+                orientation='h',
+                marker=dict(
+                    color=df_chart['lift'],
+                    colorscale='Reds',
+                    showscale=True,
+                    colorbar=dict(title='Lift')
+                ),
+                text=df_chart.apply(
+                    lambda r: f"Lift={r['lift']:.1f} | Fail#{r['fail_count']}",
+                    axis=1
+                ),
+                textposition='outside',
+                textfont=dict(size=11),
+                hovertemplate=(
+                    '<b>特征列</b>: %{customdata[0]}<br>'
+                    '<b>聚集取值</b>: %{customdata[1]}<br>'
+                    '<b>Lift</b>: %{x:.2f}<br>'
+                    '<b>p-value</b>: %{customdata[6]:.4f}<br>'
+                    '<b>Fail次数</b>: %{customdata[2]}<br>'
+                    '<b>基准次数</b>: %{customdata[3]}<br>'
+                    '<b>Fail集中度</b>: %{customdata[4]:.2%}<br>'
+                    '<b>基准占比</b>: %{customdata[5]:.2%}<br>'
+                    '<extra></extra>'
+                ),
+                customdata=df_chart[['feature', 'value', 'fail_count', 'base_count', 'p_fail', 'p_base', 'p_value']].values
+            ))
 
-        bar_fig.add_vline(
-            x=1.0, line_dash="dash", line_color="gray",
-            annotation_text="Lift=1.0 基准线", annotation_position="top"
-        )
+            bar_fig.add_vline(
+                x=1.0, line_dash="dash", line_color="gray",
+                annotation_text="Lift=1.0 基准线", annotation_position="top"
+            )
 
-        bar_fig.update_layout(
-            title='TOP 10 离散工序因素 Fail 聚集度（Lift）',
-            xaxis_title='Lift（提升度 → 越高越异常）',
-            yaxis=dict(title='', tickfont=dict(size=10), automargin=True),
-            height=650,
-            margin=dict(r=120, t=50, b=20),
-            showlegend=False
-        )
+            bar_fig.update_layout(
+                title='TOP 10 离散工序因素 Fail 聚集度（Lift）',
+                xaxis_title='Lift（提升度 -> 越高越异常）',
+                yaxis=dict(title='', tickfont=dict(size=10), automargin=True),
+                height=650,
+                margin=dict(r=120, t=50, b=20),
+                showlegend=False
+            )
 
-        st.plotly_chart(bar_fig, use_container_width=True)
+            st.plotly_chart(bar_fig, use_container_width=True)
 
     # ── Tab 2: Fail 内占比排行榜 ──
     with tab2:
-        ratio_filtered = [r for r in ratio_results if r['fail_ratio'] > 0.20]
+        ratio_filtered = [r for r in ratio_results if r['fail_ratio'] > 0.05]
         top10_ratio = get_top10_by_feature(ratio_filtered, sort_key='fail_ratio')
 
         if len(top10_ratio) == 0:
-            st.warning("无 Fail 内占比数据可用于展示（需 fail_ratio > 20% 且非缺失值）。")
+            st.warning("无 Fail 内占比数据可用于展示（需 fail_ratio > 5%）。")
         else:
             df_ratio_top = pd.DataFrame(top10_ratio)
             df_ratio_top['label'] = df_ratio_top.apply(
@@ -988,6 +1076,7 @@ def main():
 
     # ── Tab 3: 单因子 Pass/Fail 对比直方图 ──
     with tab3:
+        tab3_data = st.session_state.get('tab3_chart_data', {}) if has_cache else tab3_chart_data
         n_show = min(5, len(top10))
         if n_show == 0:
             st.warning("无 TOP 特征可用于对比分析。")
@@ -998,23 +1087,13 @@ def main():
                 lift_val = top10[rank]['lift']
                 fail_cnt = top10[rank]['fail_count']
 
-                if feat not in df_base.columns:
+                if feat not in tab3_data:
                     continue
 
                 st.markdown(f"**TOP{rank+1}**: `{feat}` (Lift={lift_val})")
 
-                # 优化：先聚类计数，再对少数唯一值进行 normalize，避免对全量数据逐行 apply
-                def get_normalized_vc(series):
-                    vc = series.value_counts(dropna=False)
-                    norm_dict = {}
-                    for k, v in vc.items():
-                        nk = normalize_val(k)
-                        if nk is not None:
-                            norm_dict[nk] = norm_dict.get(nk, 0) + v
-                    return pd.Series(norm_dict) if norm_dict else pd.Series(dtype=int)
-
-                base_vc = get_normalized_vc(df_base[feat])
-                fail_vc = get_normalized_vc(df_fail[feat])
+                base_vc = tab3_data[feat]['base_vc']
+                fail_vc = tab3_data[feat]['fail_vc']
 
                 top_vals = base_vc.sort_values(ascending=False).head(20).index.tolist()
                 if val not in top_vals:
@@ -1165,44 +1244,55 @@ def main():
     # ═══════════════════════════════════════════════
 
     st.markdown("---")
-    st.subheader("TOP 10 详细数据")
+    if len(top10) > 0:
+        st.subheader("TOP 10 详细数据")
 
-    df_display = pd.DataFrame(top10)
-    df_display.insert(0, '排名', range(1, len(df_display) + 1))
-    df_display['Fail集中度'] = df_display['p_fail'].apply(lambda x: f"{x*100:.2f}%")
-    df_display['基准占比'] = df_display['p_base'].apply(lambda x: f"{x*100:.2f}%")
-    df_display['Fail内占比'] = df_display['fail_ratio'].apply(lambda x: f"{x*100:.1f}%")
+        df_display = pd.DataFrame(top10)
+        df_display.insert(0, '排名', range(1, len(df_display) + 1))
+        df_display['Fail集中度'] = df_display['p_fail'].apply(lambda x: f"{x*100:.2f}%")
+        df_display['基准占比'] = df_display['p_base'].apply(lambda x: f"{x*100:.2f}%")
+        df_display['Fail内占比'] = df_display['fail_ratio'].apply(lambda x: f"{x*100:.1f}%")
+        df_display['p-value'] = df_display['p_value'].apply(lambda x: f"{x:.4f}" if x > 0.0001 else "<0.0001")
+        if 'p_value_adjusted' in df_display.columns:
+            df_display['FDR-q'] = df_display['p_value_adjusted'].apply(lambda x: f"{x:.4f}" if x > 0.0001 else "<0.0001")
+        else:
+            df_display['FDR-q'] = '-'
 
-    display_cols = ['排名', 'feature', 'value', 'composite_score', 'lift', 'fail_count', 'base_count', 'Fail集中度', '基准占比', 'Fail内占比']
-    st.dataframe(
-        df_display[display_cols].rename(columns={
-            'feature': '特征列', 'value': '聚集取值', 'lift': 'Lift',
-            'fail_count': 'Fail次数', 'base_count': '基准次数',
-            'composite_score': f'综合评分(Lift{lift_weight:.0%}+Fail{fail_ratio_weight:.0%})'
-        }),
-        use_container_width=True,
-        hide_index=True
-    )
+        display_cols = ['排名', 'feature', 'value', 'composite_score', 'lift', 'fail_count', 'base_count', 'Fail集中度', '基准占比', 'Fail内占比', 'p-value', 'FDR-q']
+        st.dataframe(
+            df_display[display_cols].rename(columns={
+                'feature': '特征列', 'value': '聚集取值', 'lift': 'Lift',
+                'fail_count': 'Fail次数', 'base_count': '基准次数',
+                'composite_score': f'综合评分(Lift{lift_weight:.0%}+Fail{fail_ratio_weight:.0%})',
+                'p-value': '原始p-value', 'FDR-q': 'FDR校正q-value'
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
 
-    with st.expander("查看全部 Lift > 1.0 的聚集特征"):
-        full_results = [r for r in lift_results if r['lift'] > 1.0]
+    with st.expander("查看全部 Lift > 1.0 且 Fail内占比 > 5% 的聚集特征"):
+        full_results = [r for r in lift_results if r['lift'] > 1.0 and r['fail_ratio'] > 0.05]
+        full_results.sort(key=lambda x: x['composite_score'], reverse=True)
         if full_results:
             df_full = pd.DataFrame(full_results)
             df_full['Fail集中度'] = df_full['p_fail'].apply(lambda x: f"{x*100:.2f}%")
             df_full['基准占比'] = df_full['p_base'].apply(lambda x: f"{x*100:.2f}%")
             df_full['Fail内占比'] = df_full['fail_ratio'].apply(lambda x: f"{x*100:.1f}%")
-            display_cols_full = ['feature', 'value', 'composite_score', 'lift', 'fail_count', 'base_count', 'Fail集中度', '基准占比', 'Fail内占比']
+            df_full['p-value'] = df_full['p_value'].apply(lambda x: f"{x:.4f}")
+
+            display_cols_full = ['feature', 'value', 'composite_score', 'lift', 'fail_count', 'base_count', 'Fail集中度', '基准占比', 'Fail内占比', 'p-value']
             st.dataframe(
                 df_full[display_cols_full].rename(columns={
                     'feature': '特征列', 'value': '聚集取值', 'lift': 'Lift',
                     'fail_count': 'Fail次数', 'base_count': '基准次数',
-                    'composite_score': f'综合评分(Lift{lift_weight:.0%}+Fail{fail_ratio_weight:.0%})'
+                    'composite_score': f'综合评分(Lift{lift_weight:.0%}+Fail{fail_ratio_weight:.0%})',
+                    'p-value': '显著性(p-value)'
                 }),
                 use_container_width=True,
                 hide_index=True
             )
         else:
-            st.write("无额外 Lift > 1.0 的特征")
+            st.write("无 Lift > 1.0 且 Fail内占比 > 5% 的特征")
 
     # Fail 内唯一值=1 的列单独展示
     if fail_one_results:
@@ -1256,7 +1346,7 @@ def main():
                 'fail_count': item['fail_count']
             } for item in hour_top10] if hour_top10 else None
 
-            llm_report = call_llm(LLM_API_KEY, LLM_API_BASE, LLM_MODEL, top10_for_llm, desc_map, failed_station, "全部", fail_one_data=fail_one_results, hour_top10_data=hour_top10_for_llm)
+            llm_report = call_llm(LLM_API_KEY, LLM_API_BASE, LLM_MODEL, top10_for_llm, desc_map, failed_station, str(selected_modes), fail_one_data=fail_one_results, hour_top10_data=hour_top10_for_llm)
             if llm_report:
                 llm_report_placeholder.empty()
                 st.markdown(llm_report)

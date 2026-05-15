@@ -1,7 +1,10 @@
 streamlit
 pandas
+numpy
 plotly
 requests
 openpyxl
 python-calamine
+python-dotenv
 pyarrow
+scipy
