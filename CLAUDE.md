@@ -30,7 +30,7 @@ python scratch/test_app_logic.py
 
 `app.py` is the entire application (~655 lines). The data flow is:
 
-1. **Data loading** — User uploads CSV/Excel or uses built-in mock data. Only columns in `FOCUS_COLS` + `REQUIRED_COLS` are loaded (`usecols` optimization). String columns with low cardinality are cast to `category` dtype to save memory.
+1. **Data loading** — User uploads CSV/Excel/Parquet or uses local `PRB数据.csv`. Required columns: `Results`, `Date`, `Failed_Station`, `Failure_Mode`. Columns are classified via `classify_columns()` into time, ID, meta, and discrete feature groups.
 
 2. **Filtering** — Data is filtered by date range, `Failed_Station`, and `Failure_Mode`. The "base pool" (`df_base`) contains all rows (Pass + Fail) matching filters; `df_fail` is the Fail-only subset.
 
