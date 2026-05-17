@@ -4,7 +4,6 @@
 
 ================================================================================
 【修改记录 / Changelog】
-* 2026-05-17: 引入 LightGBM 模型进行 AI 根因诊断 (Tab 5)，通过计算特征信息增益自动挖掘多因子与非线性根因组合。
 * 2026-05-16: 重构 Tab4 时间分析模块：引入 6小时(6H) 分桶聚集逻辑，并针对 Top 10 异常区段绘制了半小时粒度(30min)的 Fail 数量变化趋势线图；同步更新了大模型诊断的数据输入结构。
 * 2026-05-16: 修改 Lift 默认权重为 0.3；时间特征分析(Tab4)中排除对 _Start_Time 列的分析。
 * 2026-05-16: 全面添加 Type Hints 类型提示；引入 logging 记录系统日志；修复吞没异常的错误机制；支持 st.secrets 增加秘钥读取安全性。
@@ -551,74 +550,6 @@ def call_llm(
         return f"LLM调用异常: {str(e)[:300]}"
 
 
-def call_lgb_llm(
-    api_key: str,
-    api_base: str,
-    model: str,
-    df_imp: pd.DataFrame,
-    df_combo: Optional[pd.DataFrame]
-) -> Optional[str]:
-    """
-    调用 LLM 对 LightGBM 的分析结果进行大白话解读
-    """
-    import requests
-
-    if not api_key:
-        return None
-        
-    imp_text = df_imp.head(10).to_json(orient='records', force_ascii=False) if not df_imp.empty else "无显著特征"
-    combo_text = df_combo.head(10).to_json(orient='records', force_ascii=False) if (df_combo is not None and not df_combo.empty) else "无高危组合"
-    
-    prompt = f"""你是一名资深的3C制造质量专家。我们刚利用 LightGBM 机器学习模型对产线的 40 万条数据（包含数百个工序参数）进行了深度诊断。
-
-以下是模型提炼出的两组最致命的发现：
-
-【1. 单一特征信息增益 (Gain) 排名 Top 10】
-Gain 越高，说明该工序设备对判定产品是否 Fail 起到了决定性的拆分作用。这是“案发重灾区”。
-{imp_text}
-
-【2. 高危多因子交叉组合规则】
-这是模型从真实数据中挖掘出的致命组合。当这几个特定条件同时满足时，良率会极度崩盘（Fail概率极高）。
-{combo_text}
-
-请根据上述数据，用大白话向车间的生产主管汇报，输出纯文本的结构化指导报告，格式要求：
-1. 使用 Markdown 格式，但标题层级使用 #### 或 #####。
-2. 语言要极其通俗、精炼，**不要解释什么是 Gain 或模型原理**，直接说结论。
-3. 层次清晰：
-
-#### 🚨 核心案发地在哪
-（基于信息增益榜，指出产线目前的病灶集中在哪些特定的机台或工序段）
-
-#### 💥 致命触发条件是什么
-（基于交叉组合表，指出当哪几个特定条件同时满足时会导致大规模报废，列出 1~2 条最危险的）
-
-请使用中文输出，专业且接地气。
-"""
-
-    url = f"{api_base.rstrip('/')}/chat/completions"
-
-    try:
-        response = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-        )
-        if response.status_code == 200:
-            return response.json()["choices"][0]["message"]["content"]
-        else:
-            return f"LLM解读失败 (HTTP {response.status_code})"
-    except Exception as e:
-        return f"LLM调用异常: {str(e)[:300]}"
-
-
 def _get_cache_key(
     start_date: Any, end_date: Any, failed_station: str, lift_weight: float
 ) -> str:
@@ -816,8 +747,8 @@ def main():
         st.warning("所选日期范围内无数据，请调整日期范围。")
         return
 
-    station_values = [x for x in df_date_filtered["Failed_Station"].dropna().unique() if str(x).strip() != ""]
-    station_options = ["全部"] + sorted([str(x) for x in station_values])
+    station_values = df_date_filtered["Failed_Station"].dropna().unique()
+    station_options = ["全部"] + sorted(station_values.tolist())
     failed_station = st.sidebar.selectbox("Failed_Station", station_options, index=0)
 
     # ── 开始分析按钮 ──
@@ -1106,13 +1037,12 @@ def main():
         st.warning("未发现显著的聚集特征（所有 Lift 值均 ≤ 1.0）。")
         return
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    tab1, tab2, tab3, tab4 = st.tabs(
         [
             "📈 共性聚集度排行榜(Lift)",
             "📉 Fail内占比排行榜",
             "🔍 单因子 Pass/Fail 对比",
             "⏰ 时间小时聚集度(Hour)",
-            "🤖 AI 根因诊断 (LightGBM)",
         ]
     )
 
@@ -1433,226 +1363,6 @@ def main():
                 **说明**：排行为全流程所有时间列在各 6 小时区间中 Fail 内占比最高的 Top 10，展开展示内部半小时粒度趋势。
                 """
                 )
-
-    # ── Tab 5: AI 根因诊断 (LightGBM) ──
-    with tab5:
-        st.markdown("### 🤖 基于 LightGBM 的 AI 根因特征诊断")
-        st.info("💡 **说明**：此模块会自动将当前筛选条件下的全部离散工序特征丢入 LightGBM 树模型进行二分类训练（Pass vs Fail）。模型输出的**特征重要性（Feature Importance）**能精准捕捉导致不良的复合交叉原因。本功能基于你提供的 Dashboard 特征集。")
-        
-        @st.fragment
-        def render_ml_diagnosis():
-            if st.button("🚀 运行 AI 根因诊断 (约需10~30秒)", key="run_ml_diagnosis", type="primary"):
-                try:
-                    import lightgbm as lgb
-                except ImportError:
-                    st.error("⚠️ 当前环境未安装 LightGBM 库。\n\n请在运行此应用的终端或命令行中执行：\n\n`pip install lightgbm`\n\n安装完成后无需重启应用，直接再次点击本按钮即可。")
-                else:
-                    with st.spinner("正在训练 LightGBM 模型并提取特征重要性..."):
-                        df_base_ml = st.session_state["df_base"].copy()
-                        df_fail_ml = st.session_state["df_fail"].copy()
-                        
-                        df_ml = pd.concat([df_base_ml, df_fail_ml], ignore_index=True)
-                        
-                        if len(df_fail_ml) < 10 or len(df_base_ml) < 10:
-                            st.warning("⚠️ 样本量过小（Pass 或 Fail 数量不足 10 条），无法训练具备统计意义的模型。请放宽日期或工序筛选条件。")
-                        else:
-                            # 构造标签
-                            y = df_ml["Results"].map({"PASS": 0, "FAIL": 1})
-                            
-                            # 特征列为仪表盘配置关注的离散特征
-                            raw_features = st.session_state["all_feature_cols"]
-                            
-                            # 自动剔除精确到秒的绝对时间戳列（防噪音分类爆炸）
-                            features_to_use = []
-                            import re
-                            for c in raw_features:
-                                if c.lower() == "date":
-                                    continue
-                                # 如果以 _time 结尾且不是 _staging_time（滞留时间时长可以作为特征），则剔除
-                                if re.search(r"_time$", c, re.IGNORECASE) and not re.search(r"_staging_time$", c, re.IGNORECASE):
-                                    continue
-                                features_to_use.append(c)
-                                
-                            X = df_ml[features_to_use].copy()
-                            # 统一填充缺失值，并转换为 string -> category 以供 LightGBM 使用
-                            for col in X.columns:
-                                X[col] = X[col].fillna("缺失值").astype(str).astype('category')
-                                
-                            # 训练模型，class_weight='balanced' 处理 Pass 极多 Fail 极少的不均衡
-                            clf = lgb.LGBMClassifier(
-                                objective='binary',
-                                class_weight='balanced',
-                                n_estimators=100,
-                                importance_type='gain', # 使用信息增益
-                                n_jobs=-1,
-                                random_state=42,
-                                verbose=-1
-                            )
-                            
-                            try:
-                                clf.fit(X, y)
-                                
-                                # 提取特征重要性
-                                imp_vals = clf.booster_.feature_importance(importance_type='gain')
-                                df_imp = pd.DataFrame({
-                                    '特征列': X.columns,
-                                    '信息增益 (Gain)': imp_vals
-                                })
-                                
-                                # 过滤掉完全没用的特征
-                                df_imp = df_imp[df_imp['信息增益 (Gain)'] > 0]
-                                df_imp = df_imp.sort_values(by='信息增益 (Gain)', ascending=False)
-                                
-                                if df_imp.empty:
-                                    st.warning("模型未能找到任何具有显著信息增益区分度的特征。")
-                                else:
-                                    top_n_imp = df_imp.head(20)
-                                    
-                                    # 画图
-                                    fig_imp = go.Figure()
-                                    fig_imp.add_trace(
-                                        go.Bar(
-                                            y=top_n_imp["特征列"],
-                                            x=top_n_imp["信息增益 (Gain)"],
-                                            orientation="h",
-                                            marker=dict(
-                                                color=top_n_imp["信息增益 (Gain)"],
-                                                colorscale="Viridis",
-                                                showscale=True,
-                                                colorbar=dict(title="Gain"),
-                                            ),
-                                            text=top_n_imp["信息增益 (Gain)"].apply(lambda x: f"{x:.1f}"),
-                                            textposition="outside",
-                                            textfont=dict(size=11),
-                                        )
-                                    )
-                                    fig_imp.update_layout(
-                                        title="TOP 20 导致 Fail 的最关键特征 (LightGBM 树分裂信息增益)",
-                                        xaxis_title="信息增益 (Gain) → 越高代表对 Pass/Fail 的区分能力越强",
-                                        yaxis=dict(title="", tickfont=dict(size=10), automargin=True, autorange="reversed"),
-                                        height=max(500, len(top_n_imp) * 25),
-                                        margin=dict(l=10, r=120, t=50, b=20),
-                                        showlegend=False,
-                                    )
-                                    st.plotly_chart(fig_imp, use_container_width=True)
-                                    
-                                    st.markdown("---")
-                                    # 详细数据展开
-                                    with st.expander(f"查看具有信息增益的完整特征排行榜（共 {len(df_imp)} 项）", expanded=False):
-                                        # 合并一下特征含义
-                                        _, desc_map = load_dashboard_dict()
-                                        if desc_map:
-                                            df_imp['特征含义'] = df_imp['特征列'].map(desc_map).fillna("无描述")
-                                            cols_order = ['特征列', '特征含义', '信息增益 (Gain)']
-                                        else:
-                                            cols_order = ['特征列', '信息增益 (Gain)']
-                                            
-                                        st.dataframe(
-                                            df_imp[cols_order],
-                                            use_container_width=True,
-                                            hide_index=True
-                                        )
-                                        
-                                    st.markdown("---")
-                                    st.subheader("🔗 核心高危组合特征挖掘 (多因子交叉)")
-                                    st.info("自动提取 Top 8 核心特征进行 2~4 维度的排列组合，并回溯真实数据，精准算出真实的致命组合条件。")
-                                    
-                                    with st.spinner("正在进行多因子交叉扫描与真实概率回测..."):
-                                        top_features = df_imp.head(8)['特征列'].tolist()
-                                        
-                                        import itertools
-                                        
-                                        # 使用 string 类型防止 groupby 因为 category 的笛卡尔积耗尽内存
-                                        X_str = X[top_features].astype(str)
-                                        X_fail_str = X_str[y == 1]
-                                        X_base_str = X_str[y == 0]
-                                        
-                                        combo_results = []
-                                        # 动态计算最低发生次数，最少 5 次，最多 20 次，防止极端巧合
-                                        min_fail_count = max(5, int(len(X_fail_str) * 0.01))
-                                        if min_fail_count > 20:
-                                            min_fail_count = 20
-                                            
-                                        _, desc_map = load_dashboard_dict()
-                                        
-                                        for k in [2, 3, 4]:
-                                            if len(top_features) < k:
-                                                break
-                                                
-                                            for combo_cols in itertools.combinations(top_features, k):
-                                                combo_cols = list(combo_cols)
-                                                
-                                                fail_vc = X_fail_str.groupby(combo_cols).size()
-                                                fail_vc = fail_vc[fail_vc >= min_fail_count]
-                                                
-                                                if fail_vc.empty:
-                                                    continue
-                                                    
-                                                base_vc = X_base_str.groupby(combo_cols).size()
-                                                
-                                                for val_tuple, f_cnt in fail_vc.items():
-                                                    if k == 1:
-                                                        val_tuple = (val_tuple,)
-                                                        
-                                                    b_cnt = base_vc.get(val_tuple, 0)
-                                                    total_cnt = f_cnt + b_cnt
-                                                    ratio = f_cnt / total_cnt
-                                                    
-                                                    # 过滤转化率低于 20% 的噪音组合
-                                                    if ratio >= 0.2:
-                                                        rule_parts = []
-                                                        for col, val in zip(combo_cols, val_tuple):
-                                                            col_name = desc_map.get(col, col) if desc_map else col
-                                                            # 防止把 np.nan 转成的 'nan' 字符串显示出来，做个美化
-                                                            val_display = "缺失值" if val == "nan" else val
-                                                            rule_parts.append(f"[{col_name}]='{val_display}'")
-                                                        rule_text = " 且 ".join(rule_parts)
-                                                        
-                                                        combo_results.append({
-                                                            "维度": f"{k}维",
-                                                            "高危组合条件": rule_text,
-                                                            "Fail概率": ratio,
-                                                            "Fail次数": f_cnt,
-                                                            "基准次数": b_cnt
-                                                        })
-                                                        
-                                        if combo_results:
-                                            df_combo = pd.DataFrame(combo_results)
-                                            # 按致死率和数量双重降序
-                                            df_combo = df_combo.sort_values(by=["Fail概率", "Fail次数"], ascending=[False, False])
-                                            df_combo["Fail概率"] = df_combo["Fail概率"].apply(lambda x: f"{x * 100:.1f}%")
-                                            
-                                            st.success(f"扫描完毕！共挖掘出 **{len(df_combo)}** 条真实有效的高危组合规则（过滤条件：致死率≥20% 且 Fail样本数≥{min_fail_count}）。")
-                                            st.dataframe(
-                                                df_combo,
-                                                use_container_width=True,
-                                                hide_index=True
-                                            )
-                                        else:
-                                            st.warning(f"未能挖掘出满足最低转化率要求的多因子组合条件（Fail样本数要求≥{min_fail_count}，致死率要求≥20%）。")
-                                            
-                                        st.markdown("---")
-                                        st.subheader("🤖 大模型智能根因解读")
-                                        if LLM_API_KEY and LLM_API_KEY != "sk-your-api-key-here":
-                                            with st.spinner("大模型正在深度思考分析报告，请稍候..."):
-                                                lgb_report = call_lgb_llm(
-                                                    LLM_API_KEY, 
-                                                    LLM_API_BASE, 
-                                                    LLM_MODEL, 
-                                                    df_imp, 
-                                                    df_combo if combo_results else None
-                                                )
-                                                if lgb_report:
-                                                    st.markdown(lgb_report)
-                                                else:
-                                                    st.warning("生成大模型解读报告失败。")
-                                        else:
-                                            st.info("💡 如果在系统中配置了 LLM_API_KEY，此处将自动输出大模型生成的大白话行动指南报告。")
-                                            
-                            except Exception as e:
-                                st.error(f"训练模型或组合挖掘时发生异常: {str(e)}")
-    
-        render_ml_diagnosis()
 
     # ═══════════════════════════════════════════════
     # 详细数据表

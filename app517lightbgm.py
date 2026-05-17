@@ -27,6 +27,8 @@ import os
 import json
 import re
 import logging
+import random
+import numpy as np
 from typing import List, Dict, Tuple, Any, Optional, Union
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -60,6 +62,94 @@ LLM_API_BASE = get_secret("LLM_API_BASE", "")
 LLM_MODEL = get_secret("LLM_MODEL", "")
 
 SKIP_COLS = {"Build"}
+
+
+# ===================== MOCK DATA =====================
+def generate_mock_data(n: int = 500) -> pd.DataFrame:
+    """生成模拟数据，植入异常规律用于 Demo 验证"""
+    random.seed(42)
+    np.random.seed(42)
+
+    stations = ["METROLOGY", "FUNCTION_TEST", "FGAVI"]
+    modes_normal = [
+        "VA_STICTION_CLOSE2OPEN_MA",
+        "VA_GAINTRIM_VCMSTROKE_DIAMETER_UM",
+        "VA_CLRAMP_CLOSELINEAERREGION_FW_DIAMETER",
+        "VA_STICTION_OPEN2CLOSE_MA",
+    ]
+    TARGET_MODE = "VA_DRIVER2_AFE_P_VA/CONNECT NG"
+    machines = [f"MC_{i:03d}" for i in range(1, 16)]
+    BAD_MC = "MC_BAD_007"
+    sockets = [f"S{i}" for i in range(1, 9)]
+    nozzles = [f"N{i}" for i in range(1, 7)]
+    cavities = ["Cav_1", "Cav_2", "Cav_3", "Cav_4"]
+    vendors = ["Vendor_A", "Vendor_B", "Vendor_C"]
+    lots = [f"LOT_{i:04d}" for i in range(2001, 2021)]
+    base_date = datetime(2026, 4, 1)
+
+    proc_prefixes = [
+        "VCM_M1_FPC_UpCoil_Attach", "VCM_M1_FPC_Coil_Baking", "VCM_M1_Jet_Soldering",
+        "VCM_M2_Stator_Plasma", "VCM_M2_Stator_FPC_Attach", "VCM_M2_StatorSubAssy_Baking",
+        "VCM_M3_BCA_Plasma", "VCM_M3_BCA_Bending", "VCM_M3_BCA_Baking", "VCM_M3_StatorAssy_Baking",
+        "VCM_M4_Rotor_Plasma", "VCM_M4_Rotor_Magnet_Dispensing", "VCM_M4_Rotor_Magnet_Attach",
+        "VCM_M4_Rotor_Magnet_Baking", "VCM_M4_RotorAssy_Baking",
+        "VCM_M5_ShieldCan_Shim_Attach", "VCM_M5_ShieldCan_Shim_AutoClave",
+        "VCM_M6_StatorAssy_Plasma", "VCM_M6_StatorAssy_Grease", "VCM_M6_Ball_Rotor_Assy",
+        "VCM_M6_Blade_Assembly", "VCM_M6_ShieldCan_Assy", "VCM_M6_ShieldCan_Baking",
+        "VCM_XRay", "VCM_M7_AgGlue1", "VCM_M7_AgGlue2", "VCM_M7_AgGlue_Baking",
+        "VCM_M8_Aging", "VCM_M8_Blow_suck", "VCM_Function_Test1",
+        "VCM_M9_Cover_Attach", "VCM_M9_Cover_AutoClave", "VCM_M10_Function_test",
+    ]
+
+    rows = []
+    for i in range(n):
+        day_off = random.randint(0, 29)
+        hour = random.randint(0, 23)
+        minute = random.randint(0, 59)
+        dt = base_date + timedelta(days=day_off, hours=hour, minutes=minute)
+
+        is_fail = random.random() < 0.30
+        is_target = is_fail and random.random() < 0.45
+
+        if is_target:
+            station = "METROLOGY"
+            fm = TARGET_MODE
+            if random.random() < 0.9:
+                dt = base_date + timedelta(days=5, hours=random.randint(2, 3), minutes=minute)
+        elif is_fail:
+            station = random.choice(stations)
+            fm = random.choice(modes_normal)
+        else:
+            station = ""
+            fm = ""
+
+        row = {
+            "sn": f"SN{i:06d}", "Serial_No": f"SER-{i:06d}",
+            "Date": dt.strftime("%Y-%m-%d"),
+            "Results": "FAIL" if is_fail else "PASS",
+            "Failed_Station": station, "Failure_Mode": fm,
+            "Project": "VA3199", "Build": random.choice(["PRB", "MP"]),
+            "Config": random.choice(["Config_A", "Config_B"]),
+        }
+
+        for pfx in proc_prefixes:
+            mc = BAD_MC if is_target and random.random() < 0.9 else random.choice(machines)
+            row[f"{pfx}_MC_ID"] = mc
+            offset = random.randint(0, 30) if is_target else random.randint(0, 300)
+            row[f"{pfx}_End_Time"] = (dt + timedelta(minutes=offset)).strftime("%Y-%m-%d %H:%M:%S")
+
+        for sc in ["VCM_M8_Aging_Socket", "VCM_M3_BCA_Bending_Socket", "VCM_Function_Test1_Socket", "VCM_M10_Function_test_Socket"]:
+            row[sc] = random.choice(sockets)
+        row["VCM_M8_Aging_Nozzle"] = random.choice(nozzles)
+        row["VCM_Stator_Cavity_ID"] = random.choice(cavities)
+        row["VCM_Rotor_Cavity_ID"] = random.choice(cavities)
+        row["VCM_FPC_Vendor"] = random.choice(vendors)
+        row["VCM_Bending_Glue_lot_ID_1"] = random.choice(lots)
+        row["VCM_MagnetAttach_Glue_lot_ID_1"] = random.choice(lots)
+        row["VCM_Ag_Glue_lot_ID_1"] = random.choice(lots)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 def normalize_val(v: Any) -> Optional[str]:
@@ -675,7 +765,17 @@ def main():
     uploaded_file = st.sidebar.file_uploader(
         "上传数据文件（可选）", type=["csv", "xlsx", "xls", "parquet"]
     )
-    use_default = st.sidebar.checkbox("使用本地 PRB数据.csv", value=True)
+    use_mock = st.sidebar.checkbox(
+        "使用 Demo 模拟数据", value=False, disabled=uploaded_file is not None
+    )
+    use_default = st.sidebar.checkbox(
+        "使用本地 PRB数据.csv", value=True, disabled=use_mock
+    )
+
+    if use_mock and "df_raw" in st.session_state:
+        if st.session_state.get("uploaded_name") != "__mock__":
+            st.session_state.pop("df_raw", None)
+            st.rerun()
 
     if LLM_API_KEY and LLM_API_KEY != "sk-your-api-key-here":
         available_models = list_available_models(LLM_API_KEY, LLM_API_BASE)
@@ -706,10 +806,19 @@ def main():
         need_reload = True
     elif uploaded_file is None and st.session_state.get("uploaded_name") is not None:
         need_reload = True
+    elif (
+        use_mock
+        and st.session_state.get("uploaded_name") != "__mock__"
+        and not need_reload
+    ):
+        need_reload = True
 
     if need_reload:
         with st.spinner("正在加载数据..."):
-            if uploaded_file is not None:
+            if use_mock:
+                st.session_state["df_raw"] = generate_mock_data()
+                st.session_state["uploaded_name"] = "__mock__"
+            elif uploaded_file is not None:
                 st.session_state["df_raw"] = load_data(uploaded_file=uploaded_file)
                 st.session_state["uploaded_name"] = uploaded_file.name
             elif use_default:
@@ -816,8 +925,8 @@ def main():
         st.warning("所选日期范围内无数据，请调整日期范围。")
         return
 
-    station_values = [x for x in df_date_filtered["Failed_Station"].dropna().unique() if str(x).strip() != ""]
-    station_options = ["全部"] + sorted([str(x) for x in station_values])
+    station_values = df_date_filtered["Failed_Station"].dropna().unique()
+    station_options = ["全部"] + sorted(station_values.tolist())
     failed_station = st.sidebar.selectbox("Failed_Station", station_options, index=0)
 
     # ── 开始分析按钮 ──
