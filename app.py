@@ -379,9 +379,19 @@ def compute_lift(
     return lift_results, ratio_results, fail_one_results
 
 
+def is_col_empty(series):
+    """判断一列是否完全为空（包括真正NaN、空字符串、英文nan/none、中文'缺失值'等占位符）"""
+    s = series.dropna()
+    if s.empty:
+        return True
+    s_str = s.astype(str).str.strip().str.lower()
+    s_valid = s_str[~s_str.isin(["", "nan", "none", "缺失值", "null"])]
+    return s_valid.empty
+
+
 def get_top10_by_feature(
-    results: List[Dict[str, Any]], sort_key: str = "composite_score"
-) -> List[Dict[str, Any]]:
+    results, sort_key="composite_score"
+):
     """每个特征只保留指定指标最高的一个取值，按该指标降序取TOP 10"""
     best_per_feature = {}
     for r in results:
@@ -397,28 +407,6 @@ def get_top10_by_feature(
     return sorted_best[:10]
 
 
-def list_available_models(api_key: str, api_base: str) -> List[str]:
-    """查询 API 可用模型列表"""
-    import requests
-
-    url = f"{api_base.rstrip('/')}/models"
-    try:
-        response = requests.get(
-            url, headers={"Authorization": f"Bearer {api_key}"}, timeout=15
-        )
-        if response.status_code == 200:
-            data = response.json()
-            models = [
-                m.get("id", m) if isinstance(m, dict) else m
-                for m in data.get("data", [])
-            ]
-            return models
-        return []
-    except Exception as e:
-        logger.error(f"获取模型列表失败: {str(e)}")
-        return []
-
-
 def call_llm(
     api_key: str,
     api_base: str,
@@ -429,12 +417,14 @@ def call_llm(
     failure_mode: Optional[str],
     fail_one_data: Optional[List[Dict[str, Any]]] = None,
     hour_top10_data: Optional[List[Dict[str, Any]]] = None,
+    lgb_imp_data: Optional[pd.DataFrame] = None,
+    lgb_combo_data: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
     """
-    调用LLM生成结构化分析报告
-    仅发送TOP 10聚集度数据，不发送原始数据
+    调用LLM生成合并了统计分析与机器学习诊断的全面质量报告
     """
     import requests
+    import json
 
     if not api_key or len(top10_data) == 0:
         return None
@@ -485,44 +475,74 @@ def call_llm(
         for item in hour_top10_data:
             hour_items.append(
                 {
-                    "工序": item.get("original_feature", item["feature"].replace("_6H", "")),
-                    "聚集时间段": item["value"],
+                    "工序": item.get("original_feature", item["feature"].replace("_Day", "")),
+                    "聚集日期": item["value"],
                     "Fail内占比": f"{item['fail_ratio'] * 100:.1f}%",
                     "Fail次数": item["fail_count"],
                 }
             )
         hour_text = (
-            "\n\n#### ⏰ 时间段异常聚集 (6小时区间)\n以下为按6小时聚合的时间类制程因素中，Fail 高度集中的时段：\n"
+            "\n\n#### ⏰ 时间日期异常聚集 (按天聚合)\n以下为按天聚合的时间类制程因素中，Fail 高度集中的日期：\n"
             + json.dumps(hour_items, ensure_ascii=False, indent=2)
         )
 
-    prompt = f"""你是一名资深的3C制造质量专家。我们对产线终检Fail的产品进行了全流程（约200个工序因素）的共性聚集度分析。
-"提升度(Lift)"表示该因素在Fail产品中出现的频率远超正常水平。Lift值越高，该因素在Fail产品中越异常聚集。
-"Fail内占比"表示该取值在当前Fail样本中的占比，不考虑基准频率。Fail内占比越高，说明该取值在NG中越集中。
-"综合评分"是Lift和Fail内占比的加权组合，用于平衡两者。
+    # 💡 融入 LightGBM 的 AI 诊断特征重要性与高危组合数据
+    lgb_imp_text = "未进行 AI 特征重要性分析"
+    if lgb_imp_data is not None and not lgb_imp_data.empty:
+        lgb_imp_with_desc = []
+        for _, row in lgb_imp_data.head(10).iterrows():
+            feat = row["特征列"]
+            desc = desc_map.get(feat, "无描述")
+            lgb_imp_with_desc.append({
+                "特征列": feat,
+                "特征含义": desc,
+                "信息增益 (Gain)": float(row["信息增益 (Gain)"])
+            })
+        lgb_imp_text = json.dumps(lgb_imp_with_desc, ensure_ascii=False, indent=2)
 
-当前筛选条件：Failed_Station={failed_station if failed_station else "全部"}，Failure_Mode={failure_mode if failure_mode else "全部"}
+    lgb_combo_text = "未发现显著的交叉致死因子组合"
+    if lgb_combo_data:
+        lgb_combo_text = json.dumps(lgb_combo_data[:10], ensure_ascii=False, indent=2)
 
-以下是聚集度最高的TOP 10因素（含特征列含义）：
+    prompt = f"""[角色定位]
+你是一名卓越的 3C 智能制造与质量工程专家。当前任务是针对产线终检 Fail 样本进行全流程多维特征的共性聚集度分析与机器学习决策树特征重要性诊断。
+
+[当前筛选上下文]
+- Failed_Station (故障工位): {failed_station if failed_station else "ALL"}
+- Failure_Mode (失效模式): {failure_mode if failure_mode else "ALL"}
+
+[输入数据源]
+
+【数据源 A：传统统计共性聚集度分析（Lift 提升度）】
+以下是当前故障工位/失效模式下，故障占比与提升度最高的 Top 10 显性聚集因子数据：
 {top10_text}
 {fail_one_text}
 {hour_text}
 
-请根据上述数据，输出纯文本的结构化排查报告，格式要求：
-1. 使用 Markdown 格式，但标题层级使用 #### 或 #####（不要用过大的标题）
-2. 每个部分用短段落或 bullet points 呈现
-3. 层次清晰，重点突出
+【数据源 B：LightGBM 决策树机器学习根因诊断】
+以下是分类模型输出的 Top 10 关键根因特征（基于树分裂信息增益 Gain 排序，客观反映特征对 Pass/Fail 状态的强区分贡献度）：
+{lgb_imp_text}
 
-#### 核心不良聚集点
-（用精炼的语言指出Fail产品最集中在哪些具体的设备ID、来料批次等因素，必须引用特征列的完整名称）
+以下是模型挖掘出的高危多因子交叉组合规则（这些特征的多维复合交集在数据回测中表现出极高的致死率）：
+{lgb_combo_text}
 
-#### 异常工艺参数特征
-（指出哪些工序的时间或设备设定值在Fail产品中相对于PASS产品表现出明显的整体偏移，必须引用特征列的完整名称）
+[分析准则与输出范式]
+本报告面向数字化制造决策层。撰写过程必须遵循「高信息密度、强数据互证、严密因果逻辑、客观精炼」的工业诊断标准。请对上述统计聚集与机器学习模型计算结果进行深度的交叉验证与逻辑推导，直接输出强确定性的根因定性结论与数据关联说明。
+- 严禁包含任何文学性修饰、抒情性前言或行业通识性铺垫。
+- 本报告聚焦于“根因定位”，严禁输出任何发散性的改善步骤、现场行动建议或车间验证建议。
+- 生成的 Markdown 文档中，各部分的标题层级必须使用 #### 或 #####，且报告结构必须严格包含以下三大专业板块：
 
-#### 异常时段分析
-（指出哪些工序在哪些 6 小时区间段 Fail 高度集中，可能提示异常班次或时段性异常，必须引用工序完整列名）
+#### 🎯 异常数据聚集与特征关联分析
+（基于数据源 A，提炼单因子共性聚集特征与时间天级聚合异常趋势，指出故障样本高度集中的设备 ID、来料批次等制程设定，必须引用完整特征列名与具体量化数据）
 
-请使用中文输出，简洁专业，避免冗余叙述。提到特征时必须使用完整的特征列名称（如VCM_M1_FPC_UpCoil_Attach_Staging_time），不要简写。"""
+#### 🤖 AI 根因模型与高危复合多因子分析
+（基于数据源 B，交叉解读决策树特征重要性排行榜与多因子高危交叉组合规则，剖析哪些工艺因子在何种联合条件下发生异常交集，并指出其背后的数据致死概率）
+
+#### 🔎 核心 NG 故障根因定性结论
+（综合上述统计共性与机器学习决策树的计算共识，进行高可信度的根因归纳，用 1~2 句话直接阐明本次大批量产品发生 NG 失效的根本动力学源头与物理/工艺失准点，直奔靶心）
+
+[语言约束]
+请使用简体中文输出。分析应极其严谨专业，直陈其事。在提到任何特征字段时，必须使用数据源中的完整原始特征列名称，严禁缩写或更改。"""
 
     url = f"{api_base.rstrip('/')}/chat/completions"
 
@@ -551,90 +571,22 @@ def call_llm(
         return f"LLM调用异常: {str(e)[:300]}"
 
 
-def call_lgb_llm(
-    api_key: str,
-    api_base: str,
-    model: str,
-    df_imp: pd.DataFrame,
-    df_combo: Optional[pd.DataFrame]
-) -> Optional[str]:
-    """
-    调用 LLM 对 LightGBM 的分析结果进行大白话解读
-    """
-    import requests
-
-    if not api_key:
-        return None
-        
-    imp_text = df_imp.head(10).to_json(orient='records', force_ascii=False) if not df_imp.empty else "无显著特征"
-    combo_text = df_combo.head(10).to_json(orient='records', force_ascii=False) if (df_combo is not None and not df_combo.empty) else "无高危组合"
-    
-    prompt = f"""你是一名资深的3C制造质量专家。我们刚利用 LightGBM 机器学习模型对产线的 40 万条数据（包含数百个工序参数）进行了深度诊断。
-
-以下是模型提炼出的两组最致命的发现：
-
-【1. 单一特征信息增益 (Gain) 排名 Top 10】
-Gain 越高，说明该工序设备对判定产品是否 Fail 起到了决定性的拆分作用。这是“案发重灾区”。
-{imp_text}
-
-【2. 高危多因子交叉组合规则】
-这是模型从真实数据中挖掘出的致命组合。当这几个特定条件同时满足时，良率会极度崩盘（Fail概率极高）。
-{combo_text}
-
-请根据上述数据，用大白话向车间的生产主管汇报，输出纯文本的结构化指导报告，格式要求：
-1. 使用 Markdown 格式，但标题层级使用 #### 或 #####。
-2. 语言要极其通俗、精炼，**不要解释什么是 Gain 或模型原理**，直接说结论。
-3. 层次清晰：
-
-#### 🚨 核心案发地在哪
-（基于信息增益榜，指出产线目前的病灶集中在哪些特定的机台或工序段）
-
-#### 💥 致命触发条件是什么
-（基于交叉组合表，指出当哪几个特定条件同时满足时会导致大规模报废，列出 1~2 条最危险的）
-
-请使用中文输出，专业且接地气。
-"""
-
-    url = f"{api_base.rstrip('/')}/chat/completions"
-
-    try:
-        response = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-        )
-        if response.status_code == 200:
-            return response.json()["choices"][0]["message"]["content"]
-        else:
-            return f"LLM解读失败 (HTTP {response.status_code})"
-    except Exception as e:
-        return f"LLM调用异常: {str(e)[:300]}"
-
-
 def _get_cache_key(
-    start_date: Any, end_date: Any, failed_station: str, lift_weight: float
+    start_date: Any, end_date: Any, failed_station: str, lift_weight: float, time_resolution: str
 ) -> str:
     """生成计算结果的缓存键"""
-    return f"{start_date}_{end_date}_{failed_station}_{lift_weight}"
+    return f"{start_date}_{end_date}_{failed_station}_{lift_weight}_{time_resolution}"
 
 
 def extract_time_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    """检测时间列，抽取6小时(6H)作为离散特征，返回(修改后df, 新增列名列表)
+    """检测时间列，抽取天(Day)作为离散特征，返回(修改后df, 新增列名列表)
     只处理 _End_Time 列（实际时间戳），不处理 _Staging_time（持续秒数）和 _Start_Time
     """
-    time_6h_cols: List[str] = []
+    time_day_cols: List[str] = []
     time_pattern = re.compile(r"_End_Time$|_datetime$", re.IGNORECASE)
     n = len(df)
     if n == 0:
-        return df, time_6h_cols
+        return df, time_day_cols
 
     for col in list(df.columns):
         if col in SKIP_COLS or not time_pattern.search(col):
@@ -650,18 +602,18 @@ def extract_time_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
             if valid_ratio < 0.3:
                 continue
 
-            # 保留原时间列为 datetime 格式，方便后续半小时趋势图计算
+            # 保留原时间列为 datetime 格式，方便后续趋势图计算
             df[col] = parsed
 
-            # 生成 6 小时区间起点
-            col_6h = f"{col}_6H"
-            df[col_6h] = parsed.dt.floor("6h")
-            time_6h_cols.append(col_6h)
+            # 生成天区间起点
+            col_day = f"{col}_Day"
+            df[col_day] = parsed.dt.normalize()
+            time_day_cols.append(col_day)
 
         except Exception as e:
             logger.warning(f"处理时间列 {col} 时发生异常，跳过该列: {str(e)}")
             continue
-    return df, time_6h_cols
+    return df, time_day_cols
 
 
 def main():
@@ -672,10 +624,18 @@ def main():
 
     # ── 侧边栏：数据源 ──
     st.sidebar.header("数据源")
-    uploaded_file = st.sidebar.file_uploader(
-        "上传数据文件（可选）", type=["csv", "xlsx", "xls", "parquet"]
+    data_source = st.sidebar.radio(
+        "选择数据源",
+        options=["本地 PRB数据.csv", "上传外部数据"],
+        index=0,
+        help="选择本地 CSV 数据或上传自定义数据文件进行分析。"
     )
-    use_default = st.sidebar.checkbox("使用本地 PRB数据.csv", value=True)
+
+    uploaded_file = None
+    if data_source == "上传外部数据":
+        uploaded_file = st.sidebar.file_uploader(
+            "上传数据文件", type=["csv", "xlsx", "xls", "parquet"]
+        )
 
     if LLM_API_KEY and LLM_API_KEY != "sk-your-api-key-here":
         available_models = list_available_models(LLM_API_KEY, LLM_API_BASE)
@@ -690,48 +650,56 @@ def main():
         else:
             st.sidebar.warning(f"LLM: {LLM_MODEL} (无法获取模型列表)")
 
-    # ── 数据加载（缓存到 session_state） ──
-    dashboard_cols, desc_map = load_dashboard_dict()
+    # ── 数据源选择变化时清理缓存 ──
+    if st.session_state.get("last_data_source") != data_source:
+        st.session_state.pop("df_raw", None)
+        st.session_state.pop("uploaded_name", None)
+        st.session_state["last_data_source"] = data_source
+        # 清理分析缓存
+        for k in [
+            "lift_results", "ratio_results", "fail_one_results", "top10",
+            "df_base", "df_fail", "n_base", "n_fail", "all_feature_cols",
+            "hour_lift_results", "hour_top10", "hour_ratio_results", "hour_ratio_top10"
+        ]:
+            st.session_state.pop(k, None)
 
-    if dashboard_cols:
-        st.sidebar.caption(f"Dashboard 特征列: {len(dashboard_cols)} 列")
+    # ── 数据加载 ──
+    df_raw = None
+    desc_map = {}
+    dashboard_cols = None
 
-    need_reload = False
-    if "df_raw" not in st.session_state:
-        need_reload = True
-    elif (
-        uploaded_file is not None
-        and st.session_state.get("uploaded_name") != uploaded_file.name
-    ):
-        need_reload = True
-    elif uploaded_file is None and st.session_state.get("uploaded_name") is not None:
-        need_reload = True
-
-    if need_reload:
-        with st.spinner("正在加载数据..."):
-            if uploaded_file is not None:
-                st.session_state["df_raw"] = load_data(uploaded_file=uploaded_file)
-                st.session_state["uploaded_name"] = uploaded_file.name
-            elif use_default:
+    if data_source == "本地 PRB数据.csv":
+        dashboard_cols, desc_map = load_dashboard_dict()
+        if dashboard_cols:
+            st.sidebar.caption(f"Dashboard 特征列: {len(dashboard_cols)} 列")
+        if "df_raw" not in st.session_state:
+            with st.spinner("正在加载本地数据..."):
                 st.session_state["df_raw"] = load_data(
                     file_path=DATA_PATH, dashboard_cols=dashboard_cols
                 )
-                st.session_state["uploaded_name"] = None
-            else:
-                st.sidebar.warning("请上传数据文件或勾选使用本地数据")
-                st.info("请先在左侧配置数据源。")
-                return
-        st.session_state.pop("date_col_converted", None)
-
-    df_raw = st.session_state["df_raw"]
+        df_raw = st.session_state["df_raw"]
+        
+    elif data_source == "上传外部数据":
+        dashboard_cols, desc_map = load_dashboard_dict()
+        if dashboard_cols:
+            st.sidebar.caption(f"Dashboard 特征列: {len(dashboard_cols)} 列")
+        if uploaded_file is not None:
+            if "df_raw" not in st.session_state or st.session_state.get("uploaded_name") != uploaded_file.name:
+                with st.spinner("正在加载上传文件..."):
+                    st.session_state["df_raw"] = load_data(uploaded_file=uploaded_file)
+                    st.session_state["uploaded_name"] = uploaded_file.name
+            df_raw = st.session_state["df_raw"]
 
     if df_raw is None:
-        file_exists = os.path.exists(DATA_PATH)
-        dashboard_exists = os.path.exists(DASHBOARD_PATH)
-        st.error(
-            f"未能加载数据。\n- PRB数据.csv 存在: {file_exists}\n- dashboard F11.xlsx 存在: {dashboard_exists}"
-        )
-        st.info("请检查文件路径或上传有效文件。")
+        if data_source == "本地 PRB数据.csv":
+            file_exists = os.path.exists(DATA_PATH)
+            dashboard_exists = os.path.exists(DASHBOARD_PATH)
+            st.error(
+                f"未能加载本地数据。\n- PRB数据.csv 存在: {file_exists}\n- dashboard F11.xlsx 存在: {dashboard_exists}"
+            )
+            st.info("请确保本地数据文件放置在正确路径。")
+        elif data_source == "上传外部数据":
+            st.info("请在左侧上传并加载外部数据文件（支持 CSV, Excel, Parquet）。")
         return
 
     # ── 侧边栏：数据概览 ──
@@ -761,14 +729,9 @@ def main():
     # ── 侧边栏：筛选条件 ──
     st.sidebar.header("筛选条件")
 
-    # 缓存日期转换结果
-    if (
-        "date_col_converted" not in st.session_state
-        or st.session_state.get("date_col_name") != date_col
-    ):
+    # 智能检测并进行日期转换，确保无论何时重载均能正确识别
+    if not pd.api.types.is_datetime64_any_dtype(df_raw[date_col]):
         df_raw[date_col] = pd.to_datetime(df_raw[date_col], errors="coerce")
-        st.session_state["date_col_converted"] = True
-        st.session_state["date_col_name"] = date_col
 
     if df_raw[date_col].isna().all():
         st.error(f"日期列 `{date_col}` 所有值转换后均为空，请检查日期格式。")
@@ -799,12 +762,20 @@ def main():
         "Lift 权重",
         min_value=0.0,
         max_value=1.0,
-        value=0.3,
+        value=1.0,
         step=0.05,
         help="Lift 在综合评分中的权重，Fail内占比自动占剩余权重",
     )
     fail_ratio_weight = 1.0 - lift_weight
     st.sidebar.caption(f"Fail内占比权重: {fail_ratio_weight:.2f}")
+
+    st.sidebar.markdown("**时间分辨率**")
+    time_resolution = st.sidebar.select_slider(
+        "时间趋势轴分辨率",
+        options=["半小时", "1小时", "2小时"],
+        value="半小时",
+        help="设置 Tab 4 时间趋势图中横轴的时间聚合分辨率（每天 24 小时内的聚合跨度）",
+    )
 
     # 日期筛选（缓存）
     date_mask = (df_raw[date_col].dt.date >= start_date) & (
@@ -826,7 +797,7 @@ def main():
     )
 
     # 生成缓存键
-    cache_key = _get_cache_key(start_date, end_date, failed_station, lift_weight)
+    cache_key = _get_cache_key(start_date, end_date, failed_station, lift_weight, time_resolution)
 
     # 如果参数变化，清除旧缓存
     if st.session_state.get("last_cache_key") != cache_key:
@@ -844,6 +815,9 @@ def main():
             "hour_top10",
             "hour_ratio_results",
             "hour_ratio_top10",
+            "df_imp",
+            "combo_results",
+            "comprehensive_llm_report",
         ]:
             st.session_state.pop(k, None)
         st.session_state["last_cache_key"] = cache_key
@@ -876,6 +850,8 @@ def main():
         hour_top10 = st.session_state.get("hour_top10", [])
         hour_ratio_results = st.session_state.get("hour_ratio_results", [])
         hour_ratio_top10 = st.session_state.get("hour_ratio_top10", [])
+        df_imp = st.session_state.get("df_imp", pd.DataFrame())
+        combo_results = st.session_state.get("combo_results", [])
     else:
         # 重新计算
         with st.spinner("正在准备数据..."):
@@ -922,8 +898,10 @@ def main():
 
         filtered_cols = []
         for col in all_feature_cols:
-            if df_base[col].nunique(dropna=True) >= 2:
-                filtered_cols.append(col)
+            if col in df_base.columns and col in df_fail.columns:
+                if not is_col_empty(df_base[col]) and not is_col_empty(df_fail[col]):
+                    if df_base[col].nunique(dropna=True) >= 2:
+                        filtered_cols.append(col)
         all_feature_cols = filtered_cols
 
         st.info(
@@ -944,28 +922,27 @@ def main():
                 df_base, df_fail, all_feature_cols, lift_weight=lift_weight, min_count=3
             )
 
-        lift_progress_text.markdown("正在提取时间6小时区间特征(仅针对Fail数据)...")
+        lift_progress_text.markdown("正在提取时间按天聚合特征(仅针对Fail数据)...")
         time_cols, _, _, _ = classify_columns(df_fail)
         dayhour_ratio_results = []
 
         if time_cols:
             df_fail, dayhour_cols = extract_time_features(df_fail)
             if dayhour_cols:
-                lift_progress_text.markdown("正在计算时间类Fail占比（6小时）...")
-                for col_6h in dayhour_cols:
-                    original_col = col_6h.replace("_6H", "")
-                    fail_series = df_fail[col_6h].dropna()
+                lift_progress_text.markdown("正在计算时间类Fail占比（按天）...")
+                for col_day in dayhour_cols:
+                    original_col = col_day.replace("_Day", "")
+                    fail_series = df_fail[col_day].dropna()
                     if len(fail_series) == 0:
                         continue
                     fail_counts = fail_series.value_counts()
                     for val_dt, count in fail_counts.items():
-                        end_dt = val_dt + pd.Timedelta(hours=6)
-                        val_str = f"{val_dt.strftime('%m-%d %H:00')}~{end_dt.strftime('%H:00')}"
+                        val_str = val_dt.strftime('%Y-%m-%d')
                         
                         fail_ratio = count / n_fail
                         dayhour_ratio_results.append(
                             {
-                                "feature": col_6h,
+                                "feature": col_day,
                                 "original_feature": original_col,
                                 "value": val_str,
                                 "value_dt": val_dt,
@@ -987,6 +964,8 @@ def main():
         )
         dayhour_top10 = dayhour_ratio_top10
 
+        df_imp = pd.DataFrame()
+        combo_results = []
         lift_progress.progress(1.0)
         lift_progress_text.markdown("分析完成!")
 
@@ -1008,9 +987,197 @@ def main():
         st.session_state["hour_top10"] = dayhour_top10
         st.session_state["hour_ratio_results"] = dayhour_ratio_results
         st.session_state["hour_ratio_top10"] = dayhour_ratio_top10
+        st.session_state["df_imp"] = df_imp
+        st.session_state["combo_results"] = combo_results
 
         hour_ratio_results = dayhour_ratio_results
         hour_top10 = dayhour_top10
+
+    # ── 触发后台 ML 计算与大模型总结（完全异步，不阻塞主界面） ──
+    st.session_state["failed_station_selected"] = failed_station
+
+    def bg_ml_job(df_base_job, df_fail_job, all_cols_job, desc_map_job):
+        try:
+            import lightgbm as lgb
+            df_base_ml = df_base_job.copy()
+            df_fail_ml = df_fail_job.copy()
+            df_ml = pd.concat([df_base_ml, df_fail_ml], ignore_index=True)
+            
+            y = df_ml["Results"].map({"PASS": 0, "FAIL": 1})
+            features_to_use = []
+            import re
+            for c in all_cols_job:
+                c_lower = c.lower()
+                # 排除时间列（但保留滞留时长 staging_time）
+                if c_lower == "date" or (re.search(r"_time$", c, re.IGNORECASE) and not re.search(r"_staging_time$", c, re.IGNORECASE)):
+                    continue
+                # 排除序列号 / SN / barcode 噪音列
+                if c_lower == "sn" or c_lower.endswith("_sn") or c_lower.startswith("sn_") or "serial" in c_lower or "barcode" in c_lower:
+                    continue
+                # 排除高基数（几乎全异，例如唯一值个数超过样本总量 90% 的列）唯一标识列
+                if df_ml[c].nunique(dropna=True) > 0.9 * len(df_ml):
+                    continue
+                features_to_use.append(c)
+                
+            X = df_ml[features_to_use].copy()
+            for col in X.columns:
+                X[col] = X[col].fillna("缺失值").astype(str).astype('category')
+                
+            clf = lgb.LGBMClassifier(
+                objective='binary',
+                class_weight='balanced',
+                n_estimators=100,
+                importance_type='gain',
+                n_jobs=-1,
+                random_state=42,
+                verbose=-1
+            )
+            clf.fit(X, y)
+            imp_vals = clf.booster_.feature_importance(importance_type='gain')
+            df_imp_res = pd.DataFrame({
+                '特征列': X.columns,
+                '信息增益 (Gain)': imp_vals
+            })
+            df_imp_res = df_imp_res[df_imp_res['信息增益 (Gain)'] > 0]
+            df_imp_res = df_imp_res.sort_values(by='信息增益 (Gain)', ascending=False)
+            
+            combo_res = []
+            if not df_imp_res.empty:
+                top_features = df_imp_res.head(8)['特征列'].tolist()
+                import itertools
+                X_str = X[top_features].astype(str)
+                X_fail_str = X_str[y == 1]
+                X_base_str = X_str[y == 0]
+                min_fail_count = max(5, int(len(X_fail_str) * 0.01))
+                if min_fail_count > 20:
+                    min_fail_count = 20
+                    
+                for k in [2, 3, 4]:
+                    if len(top_features) < k:
+                        break
+                    for combo_cols in itertools.combinations(top_features, k):
+                        combo_cols = list(combo_cols)
+                        fail_vc = X_fail_str.groupby(combo_cols).size()
+                        fail_vc = fail_vc[fail_vc >= min_fail_count]
+                        if fail_vc.empty:
+                            continue
+                        base_vc = X_base_str.groupby(combo_cols).size()
+                        
+                        for val_tuple, f_cnt in fail_vc.items():
+                            b_cnt = base_vc.get(val_tuple, 0)
+                            total_cnt = f_cnt + b_cnt
+                            ratio = f_cnt / total_cnt
+                            if ratio >= 0.2:
+                                rule_parts = []
+                                for col, val in zip(combo_cols, val_tuple):
+                                    col_name = col
+                                    val_display = "缺失值" if val == "nan" else val
+                                    rule_parts.append(f"[{col_name}]='{val_display}'")
+                                rule_text = " 且 ".join(rule_parts)
+                                combo_res.append({
+                                    "维度": f"{k}维",
+                                    "高危组合条件": rule_text,
+                                    "Fail概率": ratio,
+                                    "Fail次数": f_cnt,
+                                    "基准次数": b_cnt
+                                })
+            st.session_state["df_imp"] = df_imp_res
+            st.session_state["combo_results"] = combo_res
+        except Exception as e:
+            logger.warning(f"LightGBM 自动分类训练失败: {str(e)}")
+            st.session_state["df_imp"] = pd.DataFrame()
+            st.session_state["combo_results"] = []
+        finally:
+            st.session_state["ml_running"] = False
+            start_llm_thread(desc_map_job)
+
+    def bg_llm_job(desc_map_job):
+        try:
+            top10_job = st.session_state.get("top10", [])
+            hour_top10_job = st.session_state.get("hour_top10", [])
+            fail_one_results_job = st.session_state.get("fail_one_results", [])
+            df_imp_job = st.session_state.get("df_imp", pd.DataFrame())
+            combo_results_job = st.session_state.get("combo_results", [])
+            failed_station_job = st.session_state.get("failed_station_selected", "全部")
+
+            top10_for_llm = [
+                {
+                    "排位": i + 1,
+                    "特征列": item["feature"],
+                    "聚集取值": item["value"],
+                    "综合评分": item["composite_score"],
+                    "提升度Lift": item["lift"],
+                    "Fail内占比": f"{item['fail_ratio'] * 100:.1f}%",
+                    "Fail出现次数": item["fail_count"],
+                    "基准出现次数": item["base_count"],
+                    "Fail集中度": f"{item['p_fail'] * 100:.2f}%",
+                    "基准占比": f"{item['p_base'] * 100:.2f}%",
+                }
+                for i, item in enumerate(top10_job)
+            ]
+
+            hour_top10_for_llm = (
+                [
+                    {
+                        "feature": item["feature"],
+                        "value": item["value"],
+                        "lift": item["lift"],
+                        "fail_ratio": item["fail_ratio"],
+                        "fail_count": item["fail_count"],
+                    }
+                    for item in hour_top10_job
+                ]
+                if hour_top10_job
+                else None
+            )
+
+            llm_report = call_llm(
+                LLM_API_KEY,
+                LLM_API_BASE,
+                LLM_MODEL,
+                top10_for_llm,
+                desc_map_job,
+                failed_station_job,
+                "全部",
+                fail_one_data=fail_one_results_job,
+                hour_top10_data=hour_top10_for_llm,
+                lgb_imp_data=df_imp_job,
+                lgb_combo_data=combo_results_job,
+            )
+            if llm_report:
+                st.session_state["comprehensive_llm_report"] = llm_report
+            else:
+                st.session_state["comprehensive_llm_report"] = "生成大模型解读报告失败。"
+        except Exception as e:
+            st.session_state["comprehensive_llm_report"] = f"LLM 调用异常: {str(e)[:300]}"
+        finally:
+            st.session_state["llm_running"] = False
+
+    def start_llm_thread(desc_map_job):
+        if LLM_API_KEY and LLM_API_KEY != "sk-your-api-key-here" and len(st.session_state.get("top10", [])) > 0:
+            if "comprehensive_llm_report" not in st.session_state and not st.session_state.get("llm_running", False):
+                st.session_state["llm_running"] = True
+                t_llm = threading.Thread(target=bg_llm_job, args=(desc_map_job,))
+                from streamlit.runtime.scriptrunner import add_script_run_ctx
+                add_script_run_ctx(t_llm)
+                t_llm.daemon = True
+                t_llm.start()
+
+    # 触发 ML 计算线程
+    if "df_imp" not in st.session_state and not st.session_state.get("ml_running", False):
+        if len(df_fail) >= 10 and len(df_base) >= 10:
+            st.session_state["ml_running"] = True
+            import threading
+            t_ml = threading.Thread(target=bg_ml_job, args=(df_base, df_fail, all_feature_cols, desc_map))
+            from streamlit.runtime.scriptrunner import add_script_run_ctx
+            add_script_run_ctx(t_ml)
+            t_ml.daemon = True
+            t_ml.start()
+        else:
+            st.session_state["df_imp"] = pd.DataFrame()
+            st.session_state["combo_results"] = []
+            st.session_state["ml_running"] = False
+            start_llm_thread(desc_map)
 
     # 从缓存恢复后也需要显示指标卡
     if has_cache and not analyze_btn:
@@ -1362,7 +1529,7 @@ def main():
             st.info("未发现时间类特征或时间数据不足，无法计算聚集度。")
         else:
             st.caption(
-                "将时间类制程因素按 6 小时区间聚合，提取 Fail 占比最高的时段，并展示该时段内部每半小时 Fail 数量的变化趋势。"
+                "将时间类制程因素按天聚合，提取 Fail 占比最高的日期，并展示该日期内部每半小时/1小时/2小时 Fail 数量的变化趋势。"
             )
 
             ratio_filtered = (
@@ -1377,6 +1544,24 @@ def main():
             if not top10_all:
                 st.warning("无时间类 Fail 内占比数据可用于展示。")
             else:
+                # 根据侧边栏的分辨率滑动组件动态调整聚合周期
+                # "半小时", "1小时", "2小时"
+                if time_resolution == "半小时":
+                    freq = "30min"
+                    periods = 48
+                    lbl_fmt = "%H:%M"
+                    x_title = "每半小时 (30 min)"
+                elif time_resolution == "1小时":
+                    freq = "1h"
+                    periods = 24
+                    lbl_fmt = "%H:00"
+                    x_title = "每小时 (1 h)"
+                else:  # 2小时
+                    freq = "2h"
+                    periods = 12
+                    lbl_fmt = "%H:00"
+                    x_title = "每两小时 (2 h)"
+
                 for rank, item in enumerate(top10_all):
                     feat = item["original_feature"]
                     val_str = item["value"]
@@ -1389,18 +1574,17 @@ def main():
                         f"(Fail次数: **{fail_count}**, 占比: **{fail_ratio * 100:.1f}%**)"
                     )
 
-                    # 提取该 6 小时区间的数据
-                    mask = df_fail[feat].dt.floor("6h") == val_dt
+                    # 提取该整天的数据
+                    mask = df_fail[feat].dt.normalize() == val_dt
                     df_subset = df_fail[mask]
 
                     if len(df_subset) > 0:
-                        # 按半小时聚合
-                        time_range = pd.date_range(start=val_dt, periods=12, freq="30min")
-                        counts_30min = df_subset[feat].dt.floor("30min").value_counts()
+                        time_range = pd.date_range(start=val_dt, periods=periods, freq=freq)
+                        counts_bucket = df_subset[feat].dt.floor(freq).value_counts()
 
                         df_trend = pd.DataFrame({"time": time_range})
-                        df_trend["fail_count"] = df_trend["time"].map(counts_30min).fillna(0)
-                        df_trend["time_str"] = df_trend["time"].dt.strftime("%H:%M")
+                        df_trend["fail_count"] = df_trend["time"].map(counts_bucket).fillna(0)
+                        df_trend["time_str"] = df_trend["time"].dt.strftime(lbl_fmt)
 
                         fig = go.Figure()
                         fig.add_trace(
@@ -1416,10 +1600,10 @@ def main():
 
                         fig.update_layout(
                             title=dict(
-                                text=f"{feat} Fail趋势变化",
+                                text=f"{feat} {val_str} Fail 趋势变化 ({time_resolution}分辨率)",
                                 font=dict(size=14),
                             ),
-                            xaxis_title="每半小时 (30 min)",
+                            xaxis_title=x_title,
                             yaxis_title="Fail 数量",
                             height=300,
                             margin=dict(l=20, r=20, t=40, b=20),
@@ -1429,8 +1613,8 @@ def main():
                         st.markdown("---")
 
                 st.markdown(
-                    """
-                **说明**：排行为全流程所有时间列在各 6 小时区间中 Fail 内占比最高的 Top 10，展开展示内部半小时粒度趋势。
+                    f"""
+                **说明**：排行为全流程所有时间列在各天中 Fail 内占比最高的 Top 10，展开展示内部以 **{time_resolution}** 粒度的故障变化趋势。
                 """
                 )
 
@@ -1439,220 +1623,78 @@ def main():
         st.markdown("### 🤖 基于 LightGBM 的 AI 根因特征诊断")
         st.info("💡 **说明**：此模块会自动将当前筛选条件下的全部离散工序特征丢入 LightGBM 树模型进行二分类训练（Pass vs Fail）。模型输出的**特征重要性（Feature Importance）**能精准捕捉导致不良的复合交叉原因。本功能基于你提供的 Dashboard 特征集。")
         
-        @st.fragment
-        def render_ml_diagnosis():
-            if st.button("🚀 运行 AI 根因诊断 (约需10~30秒)", key="run_ml_diagnosis", type="primary"):
-                try:
-                    import lightgbm as lgb
-                except ImportError:
-                    st.error("⚠️ 当前环境未安装 LightGBM 库。\n\n请在运行此应用的终端或命令行中执行：\n\n`pip install lightgbm`\n\n安装完成后无需重启应用，直接再次点击本按钮即可。")
+        if st.session_state.get("ml_running", False):
+            st.info("🤖 AI 决策树分类与高危组合特征挖掘正在后台全自动计算中，前台图表已就绪，请稍候...")
+        elif df_imp is None or df_imp.empty:
+            st.warning("⚠️ 样本量过小（Pass 或 Fail 数量不足 10 条）或模型未生成，无法显示 AI 特征重要性分析结果。")
+        else:
+            top_n_imp = df_imp.head(20)
+            
+            # 画图
+            fig_imp = go.Figure()
+            fig_imp.add_trace(
+                go.Bar(
+                    y=top_n_imp["特征列"],
+                    x=top_n_imp["信息增益 (Gain)"],
+                    orientation="h",
+                    marker=dict(
+                        color=top_n_imp["信息增益 (Gain)"],
+                        colorscale="Viridis",
+                        showscale=True,
+                        colorbar=dict(title="Gain"),
+                    ),
+                    text=top_n_imp["信息增益 (Gain)"].apply(lambda x: f"{x:.1f}"),
+                    textposition="outside",
+                    textfont=dict(size=11),
+                )
+            )
+            fig_imp.update_layout(
+                title="TOP 20 导致 Fail 的最关键特征 (LightGBM 树分裂信息增益)",
+                xaxis_title="信息增益 (Gain) → 越高代表对 Pass/Fail 的区分能力越强",
+                yaxis=dict(title="", tickfont=dict(size=10), automargin=True, autorange="reversed"),
+                height=max(500, len(top_n_imp) * 25),
+                margin=dict(l=10, r=120, t=50, b=20),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_imp, use_container_width=True)
+            
+            st.markdown("---")
+            # 详细数据展开
+            with st.expander(f"查看具有信息增益 of 完整特征排行榜（共 {len(df_imp)} 项）", expanded=False):
+                # 合并一下特征含义
+                _, desc_map_dict = load_dashboard_dict()
+                if not desc_map_dict:
+                    desc_map_dict = desc_map
+                if desc_map_dict:
+                    df_imp['特征含义'] = df_imp['特征列'].map(desc_map_dict).fillna("无描述")
+                    cols_order = ['特征列', '特征含义', '信息增益 (Gain)']
                 else:
-                    with st.spinner("正在训练 LightGBM 模型并提取特征重要性..."):
-                        df_base_ml = st.session_state["df_base"].copy()
-                        df_fail_ml = st.session_state["df_fail"].copy()
-                        
-                        df_ml = pd.concat([df_base_ml, df_fail_ml], ignore_index=True)
-                        
-                        if len(df_fail_ml) < 10 or len(df_base_ml) < 10:
-                            st.warning("⚠️ 样本量过小（Pass 或 Fail 数量不足 10 条），无法训练具备统计意义的模型。请放宽日期或工序筛选条件。")
-                        else:
-                            # 构造标签
-                            y = df_ml["Results"].map({"PASS": 0, "FAIL": 1})
-                            
-                            # 特征列为仪表盘配置关注的离散特征
-                            raw_features = st.session_state["all_feature_cols"]
-                            
-                            # 自动剔除精确到秒的绝对时间戳列（防噪音分类爆炸）
-                            features_to_use = []
-                            import re
-                            for c in raw_features:
-                                if c.lower() == "date":
-                                    continue
-                                # 如果以 _time 结尾且不是 _staging_time（滞留时间时长可以作为特征），则剔除
-                                if re.search(r"_time$", c, re.IGNORECASE) and not re.search(r"_staging_time$", c, re.IGNORECASE):
-                                    continue
-                                features_to_use.append(c)
-                                
-                            X = df_ml[features_to_use].copy()
-                            # 统一填充缺失值，并转换为 string -> category 以供 LightGBM 使用
-                            for col in X.columns:
-                                X[col] = X[col].fillna("缺失值").astype(str).astype('category')
-                                
-                            # 训练模型，class_weight='balanced' 处理 Pass 极多 Fail 极少的不均衡
-                            clf = lgb.LGBMClassifier(
-                                objective='binary',
-                                class_weight='balanced',
-                                n_estimators=100,
-                                importance_type='gain', # 使用信息增益
-                                n_jobs=-1,
-                                random_state=42,
-                                verbose=-1
-                            )
-                            
-                            try:
-                                clf.fit(X, y)
-                                
-                                # 提取特征重要性
-                                imp_vals = clf.booster_.feature_importance(importance_type='gain')
-                                df_imp = pd.DataFrame({
-                                    '特征列': X.columns,
-                                    '信息增益 (Gain)': imp_vals
-                                })
-                                
-                                # 过滤掉完全没用的特征
-                                df_imp = df_imp[df_imp['信息增益 (Gain)'] > 0]
-                                df_imp = df_imp.sort_values(by='信息增益 (Gain)', ascending=False)
-                                
-                                if df_imp.empty:
-                                    st.warning("模型未能找到任何具有显著信息增益区分度的特征。")
-                                else:
-                                    top_n_imp = df_imp.head(20)
-                                    
-                                    # 画图
-                                    fig_imp = go.Figure()
-                                    fig_imp.add_trace(
-                                        go.Bar(
-                                            y=top_n_imp["特征列"],
-                                            x=top_n_imp["信息增益 (Gain)"],
-                                            orientation="h",
-                                            marker=dict(
-                                                color=top_n_imp["信息增益 (Gain)"],
-                                                colorscale="Viridis",
-                                                showscale=True,
-                                                colorbar=dict(title="Gain"),
-                                            ),
-                                            text=top_n_imp["信息增益 (Gain)"].apply(lambda x: f"{x:.1f}"),
-                                            textposition="outside",
-                                            textfont=dict(size=11),
-                                        )
-                                    )
-                                    fig_imp.update_layout(
-                                        title="TOP 20 导致 Fail 的最关键特征 (LightGBM 树分裂信息增益)",
-                                        xaxis_title="信息增益 (Gain) → 越高代表对 Pass/Fail 的区分能力越强",
-                                        yaxis=dict(title="", tickfont=dict(size=10), automargin=True, autorange="reversed"),
-                                        height=max(500, len(top_n_imp) * 25),
-                                        margin=dict(l=10, r=120, t=50, b=20),
-                                        showlegend=False,
-                                    )
-                                    st.plotly_chart(fig_imp, use_container_width=True)
-                                    
-                                    st.markdown("---")
-                                    # 详细数据展开
-                                    with st.expander(f"查看具有信息增益的完整特征排行榜（共 {len(df_imp)} 项）", expanded=False):
-                                        # 合并一下特征含义
-                                        _, desc_map = load_dashboard_dict()
-                                        if desc_map:
-                                            df_imp['特征含义'] = df_imp['特征列'].map(desc_map).fillna("无描述")
-                                            cols_order = ['特征列', '特征含义', '信息增益 (Gain)']
-                                        else:
-                                            cols_order = ['特征列', '信息增益 (Gain)']
-                                            
-                                        st.dataframe(
-                                            df_imp[cols_order],
-                                            use_container_width=True,
-                                            hide_index=True
-                                        )
-                                        
-                                    st.markdown("---")
-                                    st.subheader("🔗 核心高危组合特征挖掘 (多因子交叉)")
-                                    st.info("自动提取 Top 8 核心特征进行 2~4 维度的排列组合，并回溯真实数据，精准算出真实的致命组合条件。")
-                                    
-                                    with st.spinner("正在进行多因子交叉扫描与真实概率回测..."):
-                                        top_features = df_imp.head(8)['特征列'].tolist()
-                                        
-                                        import itertools
-                                        
-                                        # 使用 string 类型防止 groupby 因为 category 的笛卡尔积耗尽内存
-                                        X_str = X[top_features].astype(str)
-                                        X_fail_str = X_str[y == 1]
-                                        X_base_str = X_str[y == 0]
-                                        
-                                        combo_results = []
-                                        # 动态计算最低发生次数，最少 5 次，最多 20 次，防止极端巧合
-                                        min_fail_count = max(5, int(len(X_fail_str) * 0.01))
-                                        if min_fail_count > 20:
-                                            min_fail_count = 20
-                                            
-                                        _, desc_map = load_dashboard_dict()
-                                        
-                                        for k in [2, 3, 4]:
-                                            if len(top_features) < k:
-                                                break
-                                                
-                                            for combo_cols in itertools.combinations(top_features, k):
-                                                combo_cols = list(combo_cols)
-                                                
-                                                fail_vc = X_fail_str.groupby(combo_cols).size()
-                                                fail_vc = fail_vc[fail_vc >= min_fail_count]
-                                                
-                                                if fail_vc.empty:
-                                                    continue
-                                                    
-                                                base_vc = X_base_str.groupby(combo_cols).size()
-                                                
-                                                for val_tuple, f_cnt in fail_vc.items():
-                                                    if k == 1:
-                                                        val_tuple = (val_tuple,)
-                                                        
-                                                    b_cnt = base_vc.get(val_tuple, 0)
-                                                    total_cnt = f_cnt + b_cnt
-                                                    ratio = f_cnt / total_cnt
-                                                    
-                                                    # 过滤转化率低于 20% 的噪音组合
-                                                    if ratio >= 0.2:
-                                                        rule_parts = []
-                                                        for col, val in zip(combo_cols, val_tuple):
-                                                            col_name = desc_map.get(col, col) if desc_map else col
-                                                            # 防止把 np.nan 转成的 'nan' 字符串显示出来，做个美化
-                                                            val_display = "缺失值" if val == "nan" else val
-                                                            rule_parts.append(f"[{col_name}]='{val_display}'")
-                                                        rule_text = " 且 ".join(rule_parts)
-                                                        
-                                                        combo_results.append({
-                                                            "维度": f"{k}维",
-                                                            "高危组合条件": rule_text,
-                                                            "Fail概率": ratio,
-                                                            "Fail次数": f_cnt,
-                                                            "基准次数": b_cnt
-                                                        })
-                                                        
-                                        if combo_results:
-                                            df_combo = pd.DataFrame(combo_results)
-                                            # 按致死率和数量双重降序
-                                            df_combo = df_combo.sort_values(by=["Fail概率", "Fail次数"], ascending=[False, False])
-                                            df_combo["Fail概率"] = df_combo["Fail概率"].apply(lambda x: f"{x * 100:.1f}%")
-                                            
-                                            st.success(f"扫描完毕！共挖掘出 **{len(df_combo)}** 条真实有效的高危组合规则（过滤条件：致死率≥20% 且 Fail样本数≥{min_fail_count}）。")
-                                            st.dataframe(
-                                                df_combo,
-                                                use_container_width=True,
-                                                hide_index=True
-                                            )
-                                        else:
-                                            st.warning(f"未能挖掘出满足最低转化率要求的多因子组合条件（Fail样本数要求≥{min_fail_count}，致死率要求≥20%）。")
-                                            
-                                        st.markdown("---")
-                                        st.subheader("🤖 大模型智能根因解读")
-                                        if LLM_API_KEY and LLM_API_KEY != "sk-your-api-key-here":
-                                            with st.spinner("大模型正在深度思考分析报告，请稍候..."):
-                                                lgb_report = call_lgb_llm(
-                                                    LLM_API_KEY, 
-                                                    LLM_API_BASE, 
-                                                    LLM_MODEL, 
-                                                    df_imp, 
-                                                    df_combo if combo_results else None
-                                                )
-                                                if lgb_report:
-                                                    st.markdown(lgb_report)
-                                                else:
-                                                    st.warning("生成大模型解读报告失败。")
-                                        else:
-                                            st.info("💡 如果在系统中配置了 LLM_API_KEY，此处将自动输出大模型生成的大白话行动指南报告。")
-                                            
-                            except Exception as e:
-                                st.error(f"训练模型或组合挖掘时发生异常: {str(e)}")
-    
-        render_ml_diagnosis()
+                    cols_order = ['特征列', '信息增益 (Gain)']
+                    
+                st.dataframe(
+                    df_imp[cols_order],
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+            st.markdown("---")
+            st.subheader("🔗 核心高危组合特征挖掘 (多因子交叉)")
+            st.info("自动提取 Top 8 核心特征进行 2~4 维度的排列组合，并回溯真实数据，精准算出真实的致命组合条件。")
+            
+            if combo_results:
+                df_combo = pd.DataFrame(combo_results)
+                # 按致死率和数量双重降序
+                df_combo = df_combo.sort_values(by=["Fail概率", "Fail次数"], ascending=[False, False])
+                df_combo["Fail概率"] = df_combo["Fail概率"].apply(lambda x: f"{x * 100:.1f}%")
+                
+                st.success(f"扫描完毕！共挖掘出 **{len(df_combo)}** 条真实有效的高危组合规则（过滤条件：致死率≥20%）。")
+                st.dataframe(
+                    df_combo,
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.warning("未能挖掘出满足最低转化率要求的多因子组合条件（致死率要求≥20%）。")
 
     # ═══════════════════════════════════════════════
     # 详细数据表
@@ -1762,71 +1804,37 @@ def main():
         """)
 
     # ═══════════════════════════════════════════════
-    # LLM 报告（放在最后）
+    # LLM 报告（放在最后，使用 st.fragment 保证不阻止前台渲染）
     # ═══════════════════════════════════════════════
 
-    st.markdown("---")
-    st.subheader("🤖 LLM 质量分析报告")
-
-    llm_report_placeholder = st.empty()
-
-    if LLM_API_KEY and LLM_API_KEY != "sk-your-api-key-here" and len(top10) > 0:
-        llm_report_placeholder.info("正在调用 LLM 生成质量分析报告，请稍候...")
-
-        top10_for_llm = [
-            {
-                "排位": i + 1,
-                "特征列": item["feature"],
-                "聚集取值": item["value"],
-                "综合评分": item["composite_score"],
-                "提升度Lift": item["lift"],
-                "Fail内占比": f"{item['fail_ratio'] * 100:.1f}%",
-                "Fail出现次数": item["fail_count"],
-                "基准出现次数": item["base_count"],
-                "Fail集中度": f"{item['p_fail'] * 100:.2f}%",
-                "基准占比": f"{item['p_base'] * 100:.2f}%",
-            }
-            for i, item in enumerate(top10)
-        ]
-
-        try:
-            hour_top10_for_llm = (
-                [
-                    {
-                        "feature": item["feature"],
-                        "value": item["value"],
-                        "lift": item["lift"],
-                        "fail_ratio": item["fail_ratio"],
-                        "fail_count": item["fail_count"],
-                    }
-                    for item in hour_top10
-                ]
-                if hour_top10
-                else None
-            )
-
-            llm_report = call_llm(
-                LLM_API_KEY,
-                LLM_API_BASE,
-                LLM_MODEL,
-                top10_for_llm,
-                desc_map,
-                failed_station,
-                "全部",
-                fail_one_data=fail_one_results,
-                hour_top10_data=hour_top10_for_llm,
-            )
-            if llm_report:
-                llm_report_placeholder.empty()
-                st.markdown(llm_report)
+    @st.fragment
+    def render_llm_report_block():
+        st.markdown("---")
+        st.subheader("🤖 LLM 智能诊断与排查行动指南")
+        
+        if LLM_API_KEY and LLM_API_KEY != "sk-your-api-key-here" and len(top10) > 0:
+            if st.session_state.get("ml_running", False):
+                st.info("⏳ AI 根因计算尚未完成，大模型分析将紧随其后开始...")
+            elif st.session_state.get("llm_running", False):
+                st.info("🤖 AI 质量分析报告深度思考生成中，前台图表已就绪...")
+            elif "comprehensive_llm_report" in st.session_state:
+                st.markdown(st.session_state["comprehensive_llm_report"])
             else:
-                llm_report_placeholder.warning(
-                    "LLM 报告生成失败，请检查 API Key 和网络连接。"
-                )
-        except Exception as e:
-            llm_report_placeholder.error(f"LLM 调用异常: {str(e)[:300]}")
-    else:
-        llm_report_placeholder.info("未配置 LLM API Key，跳过报告生成。")
+                st.info("💡 报告生成就绪，正在准备触发后台大模型分析。")
+        else:
+            st.info("💡 系统未配置有效 LLM_API_KEY，跳过大模型质量诊断报告生成。")
+
+    render_llm_report_block()
+
+
+    @st.fragment
+    def polling_fragment():
+        if st.session_state.get("ml_running", False) or st.session_state.get("llm_running", False):
+            import time
+            time.sleep(2)
+            st.rerun()
+
+    polling_fragment()
 
 
 if __name__ == "__main__":
