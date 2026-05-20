@@ -1,0 +1,95 @@
+[2026-05-20 20:17:34] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] === 异步子线程启动 ===
+[2026-05-20 20:17:34] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 参数: df_base 行数=10000, df_fail 行数=800, all_feature_cols 长度=15
+[2026-05-20 20:17:34] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] Streamlit context=True
+[2026-05-20 20:17:34] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 正在绑定 ScriptRunContext 到当前子线程...
+[2026-05-20 20:17:34] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 开始进行 LightGBM 二分类计算与特征重要性分析...
+[2026-05-20 20:17:36] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] LightGBM 与特征组合计算结束. df_imp_res 长度=14, combo_res 长度=48
+[2026-05-20 20:17:36] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 校验 ml_run_id: current_active_run_id=b5b027f1-1202-456d-a29c-14175ced30c5, 线程运行 run_id=b5b027f1-1202-456d-a29c-14175ced30c5
+[2026-05-20 20:17:36] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 正在向全局缓存写入 ML 特征重要性数据...
+[2026-05-20 20:17:36] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 正在发送第一次前端 Rerun 请求以呈现 Tab 5 图表...
+[2026-05-20 20:17:36] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 已成功调用 request_rerun 发送重新运行指令
+[2026-05-20 20:17:36] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 开始调用 LLM 大模型进行智能诊断... 模型=deepseek-v4-flash, 基础库配置 KEY=有效
+[2026-05-20 20:17:51] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 最终校验 ml_run_id: current_active_run_id=b5b027f1-1202-456d-a29c-14175ced30c5, 线程运行 run_id=b5b027f1-1202-456d-a29c-14175ced30c5
+[2026-05-20 20:17:51] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 正在向全局缓存写入大模型报告内容，并将 status 设为 success...
+[2026-05-20 20:17:51] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 已写入全局缓存. run_id=b5b027f1-1202-456d-a29c-14175ced30c5
+[2026-05-20 20:17:51] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 正在发送最终前端 Rerun 请求以呈现大模型报告，消除 Loading 状态...
+[2026-05-20 20:17:51] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:b5b027f1] 已成功调用 request_rerun 发送重新运行指令
+[2026-05-20 20:19:16] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] === 异步子线程启动 ===
+[2026-05-20 20:19:16] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=True, GLOBAL_ML_CACHE Keys=['current_active_run_id', '39564507-9157-4d8f-98b8-5b2f9b540826']
+[2026-05-20 20:19:16] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 参数: df_base 行数=10000, df_fail 行数=800, all_feature_cols 长度=15
+[2026-05-20 20:19:16] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] Streamlit context=True
+[2026-05-20 20:19:16] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 正在绑定 ScriptRunContext 到当前子线程...
+[2026-05-20 20:19:16] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 开始进行 LightGBM 二分类计算与特征重要性分析...
+[2026-05-20 20:19:18] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] LightGBM 与特征组合计算结束. df_imp_res 长度=14, combo_res 长度=48
+[2026-05-20 20:19:18] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 校验 ml_run_id: current_active_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, 线程运行 run_id=39564507-9157-4d8f-98b8-5b2f9b540826
+[2026-05-20 20:19:18] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 正在向全局缓存写入 ML 特征重要性数据...
+[2026-05-20 20:19:18] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 正在发送第一次前端 Rerun 请求以呈现 Tab 5 图表...
+[2026-05-20 20:19:18] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 已成功调用 request_rerun 发送重新运行指令
+[2026-05-20 20:19:18] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 开始调用 LLM 大模型进行智能诊断... 模型=deepseek-v4-flash, 基础库配置 KEY=有效
+[2026-05-20 20:19:19] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:21] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:24] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:27] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:29] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:32] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:32] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 最终校验 ml_run_id: current_active_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, 线程运行 run_id=39564507-9157-4d8f-98b8-5b2f9b540826
+[2026-05-20 20:19:32] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 正在向全局缓存写入大模型报告内容，并将 status 设为 success...
+[2026-05-20 20:19:32] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 已写入全局缓存. run_id=39564507-9157-4d8f-98b8-5b2f9b540826
+[2026-05-20 20:19:32] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 正在发送最终前端 Rerun 请求以呈现大模型报告，消除 Loading 状态...
+[2026-05-20 20:19:32] [Thread:Thread-4 (run_ml_and_llm_async)] [run_id:39564507] 已成功调用 request_rerun 发送重新运行指令
+[2026-05-20 20:19:34] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:37] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:40] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:43] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:45] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:48] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:50] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:53] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:56] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:19:58] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:20:01] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:20:04] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:20:06] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:20:09] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:20:12] [MainThread] ml_run_id=39564507-9157-4d8f-98b8-5b2f9b540826, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:20:44] [MainThread] ml_run_id=None, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:20:44] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] === 异步子线程启动 ===
+[2026-05-20 20:20:44] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 参数: df_base 行数=10000, df_fail 行数=800, all_feature_cols 长度=15
+[2026-05-20 20:20:44] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] Streamlit context=True
+[2026-05-20 20:20:44] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 正在绑定 ScriptRunContext 到当前子线程...
+[2026-05-20 20:20:44] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 开始进行 LightGBM 二分类计算与特征重要性分析...
+[2026-05-20 20:20:46] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] LightGBM 与特征组合计算结束. df_imp_res 长度=14, combo_res 长度=48
+[2026-05-20 20:20:46] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 校验 ml_run_id: current_active_run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6, 线程运行 run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6
+[2026-05-20 20:20:46] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 正在向全局缓存写入 ML 特征重要性数据...
+[2026-05-20 20:20:46] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 正在发送第一次前端 Rerun 请求以呈现 Tab 5 图表...
+[2026-05-20 20:20:46] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 已成功调用 request_rerun 发送重新运行指令
+[2026-05-20 20:20:46] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 开始调用 LLM 大模型进行智能诊断... 模型=deepseek-v4-flash, 基础库配置 KEY=有效
+[2026-05-20 20:20:47] [MainThread] ml_run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6, in GLOBAL_ML_CACHE=True, GLOBAL_ML_CACHE Keys=['current_active_run_id', '37bc6a06-84a9-4b18-a6e0-d26b392ce9f6']
+[2026-05-20 20:20:50] [MainThread] ml_run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6, in GLOBAL_ML_CACHE=True, GLOBAL_ML_CACHE Keys=['current_active_run_id', '37bc6a06-84a9-4b18-a6e0-d26b392ce9f6']
+[2026-05-20 20:20:52] [MainThread] ml_run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6, in GLOBAL_ML_CACHE=True, GLOBAL_ML_CACHE Keys=['current_active_run_id', '37bc6a06-84a9-4b18-a6e0-d26b392ce9f6']
+[2026-05-20 20:20:55] [MainThread] ml_run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6, in GLOBAL_ML_CACHE=True, GLOBAL_ML_CACHE Keys=['current_active_run_id', '37bc6a06-84a9-4b18-a6e0-d26b392ce9f6']
+[2026-05-20 20:20:57] [MainThread] ml_run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6, in GLOBAL_ML_CACHE=True, GLOBAL_ML_CACHE Keys=['current_active_run_id', '37bc6a06-84a9-4b18-a6e0-d26b392ce9f6']
+[2026-05-20 20:21:00] [MainThread] ml_run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6, in GLOBAL_ML_CACHE=True, GLOBAL_ML_CACHE Keys=['current_active_run_id', '37bc6a06-84a9-4b18-a6e0-d26b392ce9f6']
+[2026-05-20 20:21:03] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 最终校验 ml_run_id: current_active_run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6, 线程运行 run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6
+[2026-05-20 20:21:03] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 正在向全局缓存写入大模型报告内容，并将 status 设为 success...
+[2026-05-20 20:21:03] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 已写入全局缓存. run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6
+[2026-05-20 20:21:03] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 正在发送最终前端 Rerun 请求以呈现大模型报告，消除 Loading 状态...
+[2026-05-20 20:21:03] [Thread:Thread-5 (run_ml_and_llm_async)] [run_id:37bc6a06] 已成功调用 request_rerun 发送重新运行指令
+[2026-05-20 20:21:04] [MainThread] ml_run_id=37bc6a06-84a9-4b18-a6e0-d26b392ce9f6, in GLOBAL_ML_CACHE=True, GLOBAL_ML_CACHE Keys=['current_active_run_id', '37bc6a06-84a9-4b18-a6e0-d26b392ce9f6']
+[2026-05-20 20:21:57] [MainThread] ml_run_id=None, in GLOBAL_ML_CACHE=False, GLOBAL_ML_CACHE Keys=[]
+[2026-05-20 20:21:57] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] === 异步子线程启动 ===
+[2026-05-20 20:21:57] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 参数: df_base 行数=10000, df_fail 行数=800, all_feature_cols 长度=15
+[2026-05-20 20:21:57] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] Streamlit context=True
+[2026-05-20 20:21:57] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 正在绑定 ScriptRunContext 到当前子线程...
+[2026-05-20 20:21:57] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 开始进行 LightGBM 二分类计算与特征重要性分析...
+[2026-05-20 20:21:59] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] LightGBM 与特征组合计算结束. df_imp_res 长度=14, combo_res 长度=48
+[2026-05-20 20:21:59] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 校验 ml_run_id: current_active_run_id=dabc6f51-dc00-4fdd-9191-d36d72f7b8a5, 线程运行 run_id=dabc6f51-dc00-4fdd-9191-d36d72f7b8a5
+[2026-05-20 20:21:59] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 正在向全局缓存写入 ML 特征重要性数据...
+[2026-05-20 20:21:59] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 正在发送第一次前端 Rerun 请求以呈现 Tab 5 图表...
+[2026-05-20 20:21:59] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 已成功调用 request_rerun 发送重新运行指令
+[2026-05-20 20:21:59] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 开始调用 LLM 大模型进行智能诊断... 模型=deepseek-v4-flash, 基础库配置 KEY=有效
+[2026-05-20 20:22:13] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 最终校验 ml_run_id: current_active_run_id=dabc6f51-dc00-4fdd-9191-d36d72f7b8a5, 线程运行 run_id=dabc6f51-dc00-4fdd-9191-d36d72f7b8a5
+[2026-05-20 20:22:13] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 正在向全局缓存写入大模型报告内容，并将 status 设为 success...
+[2026-05-20 20:22:13] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 已写入全局缓存. run_id=dabc6f51-dc00-4fdd-9191-d36d72f7b8a5
+[2026-05-20 20:22:13] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 正在发送最终前端 Rerun 请求以呈现大模型报告，消除 Loading 状态...
+[2026-05-20 20:22:13] [Thread:Thread-240 (run_ml_and_llm_async)] [run_id:dabc6f51] 已成功调用 request_rerun 发送重新运行指令
