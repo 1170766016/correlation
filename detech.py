@@ -9,7 +9,12 @@ import os
 import json
 import datetime
 import sqlite3
+try:
+    import pyodbc
+except ImportError:
+    pyodbc = None
 import binascii
+import hashlib
 import urllib.request
 import urllib.error
 import pathlib
@@ -114,6 +119,7 @@ class WinPcapFilter:
         ttk.Button(btn_frame, text="分析异常连接", command=self.analyze_connections).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="LLM分析错误", command=self.llm_analyze_errors).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="LLM设置", command=self.open_llm_settings).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="数据库设置", command=self.open_db_settings).pack(side="left", padx=5)
 
     # ---- 工具方法 ----
 
@@ -394,8 +400,10 @@ class WinPcapFilter:
             threading.Thread(target=_save_pcap_task, daemon=True).start()
 
     @staticmethod
-    def _packet_to_row(pcap_file: str, idx: int, pkt, max_hex_bytes: int = 2048) -> tuple:
+    def _packet_to_row(pcap_file: str, pkt, pcap_hash: Optional[str] = None) -> tuple:
         ts = float(pkt.time) if hasattr(pkt, 'time') else None
+        packet_time = datetime.datetime.fromtimestamp(ts) if ts is not None else None
+        file_name = os.path.basename(pcap_file) if pcap_file else None
         
         # 使用 getlayer 缓存层对象，极大提升属性检索效率
         ether_layer = pkt.getlayer(Ether)
@@ -409,33 +417,98 @@ class WinPcapFilter:
         
         tcp_layer = pkt.getlayer(TCP)
         udp_layer = pkt.getlayer(UDP)
-        icmp_layer = pkt.getlayer(ICMP)
         
         if tcp_layer:
-            proto, sport, dport = "TCP", tcp_layer.sport, tcp_layer.dport
+            sport, dport = tcp_layer.sport, tcp_layer.dport
         elif udp_layer:
-            proto, sport, dport = "UDP", udp_layer.sport, udp_layer.dport
-        elif icmp_layer:
-            proto, sport, dport = "ICMP", None, None
+            sport, dport = udp_layer.sport, udp_layer.dport
         else:
-            proto, sport, dport = "OTHER", None, None
+            sport, dport = None, None
 
-        # 截取前 max_hex_bytes 字节，避免大包（如 jumbo frame）导致数据库膨胀
-        raw_hex = None
-        if hasattr(pkt, 'build'):
-            try:
-                raw_bytes = bytes(pkt)[:max_hex_bytes]
-                raw_hex = binascii.hexlify(raw_bytes).decode('ascii')
-            except Exception as build_err:
-                raw_hex = f"ERROR_SERIALIZE: {str(build_err)}"
+        # 提取 TCP 报文的特有字段 (flag, seq, ack, len)
+        flag_val = None
+        seq_val = None
+        ack_val = None
+        len_val = None
+
+        if tcp_layer:
+            t = tcp_layer
+            flags = []
+            if t.flags & 0x02: flags.append("SYN")
+            if t.flags & 0x10: flags.append("ACK")
+            if t.flags & 0x01: flags.append("FIN")
+            if t.flags & 0x04: flags.append("RST")
+            if t.flags & 0x08: flags.append("PSH")
+            if t.flags & 0x20: flags.append("URG")
+            flag_val = " ".join(flags) if flags else str(t.flags)
+            
+            seq_val = t.seq
+            ack_val = t.ack
+            
+            # 计算载荷长度
+            payload_len = 0
+            if ip_layer:
+                ip_len = ip_layer.len if ip_layer.len is not None else len(bytes(ip_layer))
+                ip_hdr = ip_layer.ihl * 4
+                tcp_hdr = t.dataofs * 4 if t.dataofs is not None else 20
+                payload_len = max(0, ip_len - ip_hdr - tcp_hdr)
+            elif ipv6_layer:
+                payload_len = len(bytes(t.payload)) if t.payload else 0
+            len_val = payload_len
+
+        # 构造定制的 summary 字段格式
+        summary_lines = []
+        ts_str = packet_time.strftime("%Y-%m-%d %H:%M:%S.%f") if packet_time else "N/A"
+        summary_lines.append(f"时间：{ts_str}")
+        if ether_layer:
+            summary_lines.append(f"MAC：{ether_layer.src} → {ether_layer.dst}")
+        if ip_layer:
+            summary_lines.append(f"IP：{ip_layer.src} → {ip_layer.dst}")
+        elif ipv6_layer:
+            summary_lines.append(f"IPv6：{ipv6_layer.src} → {ipv6_layer.dst}")
+        if tcp_layer:
+            summary_lines.append(f"TCP 端口：{tcp_layer.sport} → {tcp_layer.dport}")
+        elif udp_layer:
+            summary_lines.append(f"UDP 端口：{udp_layer.sport} → {udp_layer.dport}")
+        summary_lines.append(f"Info：{WinPcapFilter._packet_info(pkt)}")
+        summary_val = "\n".join(summary_lines)
+
+        insert_time = datetime.datetime.now()
+
+        # 计算单条报文的唯一哈希值
+        h_pkt = hashlib.md5()
+        pkt_ts_str = f"{ts:.6f}" if ts is not None else ""
+        h_pkt.update(pkt_ts_str.encode('utf-8'))
+        h_pkt.update(str(mac_src or '').encode('utf-8'))
+        h_pkt.update(str(mac_dst or '').encode('utf-8'))
+        h_pkt.update(str(ip_src or '').encode('utf-8'))
+        h_pkt.update(str(ip_dst or '').encode('utf-8'))
+        h_pkt.update(str(sport or '').encode('utf-8'))
+        h_pkt.update(str(dport or '').encode('utf-8'))
+        h_pkt.update(str(flag_val or '').encode('utf-8'))
+        h_pkt.update(str(seq_val or '').encode('utf-8'))
+        h_pkt.update(str(ack_val or '').encode('utf-8'))
+        h_pkt.update(str(len_val or '').encode('utf-8'))
+        try:
+            h_pkt.update(bytes(pkt))
+        except Exception:
+            pass
+        packet_hash = h_pkt.hexdigest()
 
         return (
-            pcap_file, idx, ts,
+            file_name,
+            pcap_hash,
+            packet_hash,
+            packet_time,
             mac_src, mac_dst,
             ip_src, ip_dst,
-            proto, sport, dport,
-            len(pkt), WinPcapFilter._packet_info(pkt),
-            raw_hex
+            sport, dport,
+            flag_val,
+            seq_val,
+            ack_val,
+            len_val,
+            summary_val,
+            insert_time
         )
 
     def save_to_db(self) -> None:
@@ -446,50 +519,178 @@ class WinPcapFilter:
             messagebox.showwarning("提示", "无数据可保存，请先过滤")
             return
 
-        path = filedialog.asksaveasfilename(
-            defaultextension=".db",
-            filetypes=[("SQLite数据库", "*.db"), ("所有文件", "*.*")]
-        )
-        if not path:
+        if pyodbc is None:
+            messagebox.showerror(
+                "驱动错误", 
+                "未找到 pyodbc 模块。请在您的 Python 环境中安装 pyodbc 以连接 SQL Server：\n"
+                "  pip install pyodbc"
+            )
+            return
+
+        cfg = self._load_db_config()
+        server = cfg.get("server", "localhost")
+        port = cfg.get("port", "1433")
+        database = cfg.get("database", "pcap_db")
+        username = cfg.get("username", "")
+        password = cfg.get("password", "")
+        driver = cfg.get("driver", "ODBC Driver 17 for SQL Server")
+        table_name = cfg.get("table_name", "packets")
+
+        if not server or not database:
+            messagebox.showerror("错误", "请先配置正确的数据库服务器与数据库名称！")
+            self.open_db_settings()
             return
 
         self._set_busy(True)
         self._update_progress(0)
-        self.show_text.insert("end", f"\n正在保存数据到数据库，请稍候...\n")
+        self.show_text.insert("end", f"\n正在保存数据到 SQL Server 数据库 {server} ({database})...\n")
 
         def _save_db_task():
             conn = None
             try:
-                conn = sqlite3.connect(path)
-                conn.execute("BEGIN TRANSACTION;")  # 显式开启原子事务
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS packets (
-                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                        pcap_file   TEXT,
-                        packet_idx  INTEGER,
-                        timestamp   REAL,
-                        mac_src     TEXT,
-                        mac_dst     TEXT,
-                        ip_src      TEXT,
-                        ip_dst      TEXT,
-                        protocol    TEXT,
-                        sport       INTEGER,
-                        dport       INTEGER,
-                        pkt_len     INTEGER,
-                        summary     TEXT,
-                        raw_hex     TEXT
-                    )
-                """)
+                # 计算当前 PCAP 文件的 MD5 哈希指纹
+                pcap_hash = ""
+                if os.path.exists(self.pcap_path):
+                    md5 = hashlib.md5()
+                    try:
+                        with open(self.pcap_path, "rb") as f:
+                            for chunk in iter(lambda: f.read(4096), b""):
+                                md5.update(chunk)
+                        pcap_hash = md5.hexdigest()
+                    except Exception:
+                        pass
 
-                sql = """
-                    INSERT INTO packets
-                        (pcap_file, packet_idx, timestamp, mac_src, mac_dst,
-                         ip_src, ip_dst, protocol, sport, dport,
-                         pkt_len, summary, raw_hex)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                # 构造 SQL Server 连接字符串
+                if username:
+                    # 使用 SQL Server 身份验证
+                    conn_str = f"DRIVER={{{driver}}};SERVER={server},{port};DATABASE={database};UID={username};PWD={password}"
+                else:
+                    # 使用 Windows 身份验证
+                    conn_str = f"DRIVER={{{driver}}};SERVER={server},{port};DATABASE={database};Trusted_Connection=yes"
+
+                conn = pyodbc.connect(conn_str)
+                cursor = conn.cursor()
+                
+                # 开启显式事务以获得最佳性能并保证 ACID 原则
+                conn.autocommit = False
+
+                # 创建表的 SQL 语句，增加 pcap_hash 和 packet_hash 字段，使用方括号防止保留字冲突
+                create_table_sql = f"""
+                IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{table_name}' AND xtype='U')
+                CREATE TABLE [{table_name}] (
+                    id          INT IDENTITY(1,1) PRIMARY KEY,
+                    pcap_file   VARCHAR(255),
+                    pcap_hash   VARCHAR(64),
+                    packet_hash VARCHAR(64),
+                    timestamp   DATETIME2(6),
+                    mac_src     VARCHAR(20),
+                    mac_dst     VARCHAR(20),
+                    ip_src      VARCHAR(45),
+                    ip_dst      VARCHAR(45),
+                    sport       INT,
+                    dport       INT,
+                    flag        VARCHAR(30),
+                    seq         BIGINT,
+                    ack         BIGINT,
+                    len         INT,
+                    summary     NVARCHAR(300),
+                    insert_time DATETIME2(3)
+                )
+                """
+                cursor.execute(create_table_sql)
+                conn.commit()
+
+                # 如果表已经存在，则自动检查并添加缺少的列，确保平滑升级
+                alter_table_sql = f"""
+                IF EXISTS (SELECT * FROM sysobjects WHERE name='{table_name}' AND xtype='U')
+                BEGIN
+                    -- 如果 timestamp 字段还是 FLOAT 类型，则将其转换为 DATETIME2(6)
+                    IF EXISTS (SELECT * FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id WHERE c.object_id = OBJECT_ID('{table_name}') AND c.name = 'timestamp' AND t.name != 'datetime2')
+                        ALTER TABLE [{table_name}] ALTER COLUMN timestamp DATETIME2(6);
+                        
+                    -- 添加缺少的列，采用紧凑的长度设计以节省空间
+                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'pcap_hash')
+                        ALTER TABLE [{table_name}] ADD pcap_hash VARCHAR(64);
+                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'packet_hash')
+                        ALTER TABLE [{table_name}] ADD packet_hash VARCHAR(64);
+                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'flag')
+                        ALTER TABLE [{table_name}] ADD flag VARCHAR(30);
+                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'seq')
+                        ALTER TABLE [{table_name}] ADD seq BIGINT;
+                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'ack')
+                        ALTER TABLE [{table_name}] ADD ack BIGINT;
+                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'len')
+                        ALTER TABLE [{table_name}] ADD len INT;
+                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'insert_time')
+                        ALTER TABLE [{table_name}] ADD insert_time DATETIME2(3);
+                END
+                """
+                cursor.execute(alter_table_sql)
+                conn.commit()
+
+                # 建立非聚集索引以确保在大数据量下的文件名、哈希寻靶性能（Index Seek）
+                index_pcap_file_sql = f"""
+                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('{table_name}') AND name = 'IX_{table_name}_pcap_file')
+                    CREATE INDEX [IX_{table_name}_pcap_file] ON [{table_name}] (pcap_file);
+                """
+                cursor.execute(index_pcap_file_sql)
+
+                index_pcap_hash_sql = f"""
+                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('{table_name}') AND name = 'IX_{table_name}_pcap_hash')
+                    CREATE INDEX [IX_{table_name}_pcap_hash] ON [{table_name}] (pcap_hash);
+                """
+                cursor.execute(index_pcap_hash_sql)
+
+                # 建立过滤空值的唯一索引，开启 IGNORE_DUP_KEY 确保批量插入时静默过滤重复行
+                unique_packet_hash_sql = f"""
+                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('{table_name}') AND name = 'UQ_{table_name}_packet_hash')
+                    CREATE UNIQUE INDEX [UQ_{table_name}_packet_hash] 
+                    ON [{table_name}] (packet_hash) 
+                    WHERE packet_hash IS NOT NULL 
+                    WITH (IGNORE_DUP_KEY = ON);
+                """
+                cursor.execute(unique_packet_hash_sql)
+                conn.commit()
+
+                file_name = os.path.basename(self.pcap_path)
+
+                # 1. 检查是否存在相同内容指纹的文件已保存在数据库（支持防改名重复上传）
+                if pcap_hash:
+                    cursor.execute(f"SELECT DISTINCT pcap_file FROM [{table_name}] WHERE pcap_hash = ?", (pcap_hash,))
+                    existing_file_row = cursor.fetchone()
+                    if existing_file_row:
+                        existing_filename = existing_file_row[0]
+                        self.root.after(0, lambda: (
+                            self.show_text.insert("end", f"检测到数据库中已存在相同内容的抓包文件（原文件名：{existing_filename}），已自动跳过导入。\n"),
+                            messagebox.showinfo("提示", f"抓包文件内容已存在于数据库中（原文件名：{existing_filename}），无需重复保存。")
+                        ))
+                        return
+
+                # 2. 检查文件名是否相同
+                cursor.execute(f"SELECT DISTINCT pcap_hash FROM [{table_name}] WHERE pcap_file = ?", (file_name,))
+                existing_rows = cursor.fetchall()
+                if existing_rows:
+                    has_same_hash = any(r[0] == pcap_hash for r in existing_rows)
+                    if has_same_hash:
+                        self.root.after(0, lambda: (
+                            self.show_text.insert("end", f"检测到数据库中已存在同名且内容相同的抓包文件 {file_name}，已自动跳过导入。\n"),
+                            messagebox.showinfo("提示", f"同名且内容相同的抓包文件 {file_name} 已存在，已自动跳过。")
+                        ))
+                        return
+                    else:
+                        # 覆盖旧数据（删除当前同名文件的记录）
+                        self.root.after(0, lambda: self.show_text.insert("end", f"检测到同名但内容不同的抓包文件 {file_name}，正在覆盖数据库中的旧数据...\n"))
+                        cursor.execute(f"DELETE FROM [{table_name}] WHERE pcap_file = ?", (file_name,))
+
+                sql = f"""
+                    INSERT INTO [{table_name}]
+                        (pcap_file, pcap_hash, packet_hash, timestamp, mac_src, mac_dst,
+                         ip_src, ip_dst, sport, dport, flag,
+                         seq, ack, len, summary, insert_time)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """
 
-                # 分批插入，避免一次性构建所有 row 占用过多内存
+                # 分批插入，避免一次性构建所有 row 占用过多内存并突破 pyodbc 单次参数上限
                 total = len(self.filtered_pkts)
                 inserted = 0
                 for batch_start in range(0, total, self.DB_BATCH_SIZE):
@@ -497,9 +698,9 @@ class WinPcapFilter:
                     rows = []
                     for j in range(batch_start, batch_end):
                         rows.append(self._packet_to_row(
-                            self.pcap_path, j + 1, self.filtered_pkts[j], self.RAW_HEX_MAX_BYTES
+                            self.pcap_path, self.filtered_pkts[j], pcap_hash
                         ))
-                    conn.executemany(sql, rows)
+                    cursor.executemany(sql, rows)
                     inserted += len(rows)
 
                     # 动态更新进度条
@@ -507,22 +708,25 @@ class WinPcapFilter:
                         progress = (inserted / total) * 100
                         self.root.after(0, lambda p=progress: self._update_progress(p))
 
-                conn.commit()  # 批量插入成功，单次全局commit，性能跃升数十倍并保障强一致性
+                conn.commit()  # 提交所有事务
                 self.root.after(0, lambda i=inserted: (
-                    self.show_text.insert("end", f"已保存 {i} 条报文到数据库：{path}\n"),
-                    messagebox.showinfo("成功", f"已保存 {i} 条报文到数据库")
+                    self.show_text.insert("end", f"已成功保存 {i} 条报文至 SQL Server 表 [{table_name}]\n"),
+                    messagebox.showinfo("成功", f"已成功保存 {i} 条报文到 SQL Server")
                 ))
             except Exception as e:
                 if conn:
                     try:
-                        conn.rollback()  # 发生任何异常，全部事务强行回滚，保障ACID原子一致性不留脏数据
+                        conn.rollback()  # 发生任何异常，全部事务强制回滚
                     except Exception:
                         pass
                 err_msg = str(e)
                 self.root.after(0, lambda m=err_msg: messagebox.showerror("错误", f"保存数据库失败：{m}"))
             finally:
                 if conn:
-                    conn.close()
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
                 self.root.after(0, lambda: (
                     self._set_busy(False),
                     self._update_progress(100)
@@ -725,6 +929,154 @@ class WinPcapFilter:
                 ))
 
         threading.Thread(target=_analyze_task, daemon=True).start()
+
+    # ---- 数据库 相关 ----
+
+    @property
+    def _db_config_path(self) -> str:
+        return os.path.join(os.path.dirname(__file__), "db_config.json")
+
+    def _load_db_config(self) -> Dict[str, Any]:
+        """加载数据库配置，环境变量优先覆盖文件值"""
+        path = self._db_config_path
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except Exception:
+                cfg = {}
+        else:
+            cfg = {}
+
+        # 默认配置值
+        default_cfg = {
+            "server": "localhost",
+            "port": "1433",
+            "database": "pcap_db",
+            "username": "",
+            "password": "",
+            "driver": "ODBC Driver 17 for SQL Server",
+            "table_name": "packets"
+        }
+        
+        # 合并默认值
+        for k, v in default_cfg.items():
+            if k not in cfg:
+                cfg[k] = v
+
+        # 环境变量优先覆盖
+        env_server = os.environ.get("COMPANY_DB_SERVER", "")
+        env_port = os.environ.get("COMPANY_DB_PORT", "")
+        env_database = os.environ.get("COMPANY_DB_NAME", "")
+        env_username = os.environ.get("COMPANY_DB_USER", "")
+        env_password = os.environ.get("COMPANY_DB_PASS", "")
+        env_driver = os.environ.get("COMPANY_DB_DRIVER", "")
+        
+        if env_server:
+            cfg["server"] = env_server
+        if env_port:
+            cfg["port"] = env_port
+        if env_database:
+            cfg["database"] = env_database
+        if env_username:
+            cfg["username"] = env_username
+        if env_password:
+            cfg["password"] = env_password
+        if env_driver:
+            cfg["driver"] = env_driver
+
+        return cfg
+
+    def _save_db_config(self, config: Dict[str, Any]) -> None:
+        """保存数据库配置到文件。若密码来自环境变量则不重复写入文件，降低明文泄露风险。"""
+        path = self._db_config_path
+        save_config = dict(config)
+
+        # 如果环境变量中已有密码且与当前值相同，则不写入文件
+        env_pass = os.environ.get("COMPANY_DB_PASS", "")
+        if env_pass and save_config.get("password") == env_pass:
+            save_config["password"] = ""
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(save_config, f, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+    def open_db_settings(self) -> None:
+        cfg = self._load_db_config()
+        env_pass_present = bool(os.environ.get("COMPANY_DB_PASS", ""))
+
+        win = tk.Toplevel(self.root)
+        win.title("数据库设置 (SQL Server)")
+        win.geometry("580x360")
+        win.resizable(False, False)
+        win.grab_set()  # 启用模态，锁定父窗口焦点
+
+        # Grid布局配置
+        win.columnconfigure(1, weight=1)
+
+        # Server
+        ttk.Label(win, text="服务器 (Server):").grid(row=0, column=0, sticky="w", padx=15, pady=(15,5))
+        server_var = tk.StringVar(value=cfg.get("server", ""))
+        ttk.Entry(win, textvariable=server_var, width=40).grid(row=0, column=1, sticky="w", padx=15, pady=(15,5))
+
+        # Port
+        ttk.Label(win, text="端口 (Port):").grid(row=1, column=0, sticky="w", padx=15, pady=5)
+        port_var = tk.StringVar(value=cfg.get("port", "1433"))
+        ttk.Entry(win, textvariable=port_var, width=15).grid(row=1, column=1, sticky="w", padx=15, pady=5)
+
+        # Database
+        ttk.Label(win, text="数据库名 (Database):").grid(row=2, column=0, sticky="w", padx=15, pady=5)
+        database_var = tk.StringVar(value=cfg.get("database", ""))
+        ttk.Entry(win, textvariable=database_var, width=40).grid(row=2, column=1, sticky="w", padx=15, pady=5)
+
+        # Username
+        ttk.Label(win, text="用户名 (Username):").grid(row=3, column=0, sticky="w", padx=15, pady=5)
+        username_var = tk.StringVar(value=cfg.get("username", ""))
+        ttk.Entry(win, textvariable=username_var, width=40).grid(row=3, column=1, sticky="w", padx=15, pady=5)
+        ttk.Label(win, text="（留空表示使用 Windows 身份验证）", foreground="gray").grid(row=3, column=2, sticky="w", padx=(0,15))
+
+        # Password
+        ttk.Label(win, text="密码 (Password):").grid(row=4, column=0, sticky="w", padx=15, pady=5)
+        password_var = tk.StringVar(value=cfg.get("password", ""))
+        ttk.Entry(win, textvariable=password_var, width=40, show="*").grid(row=4, column=1, sticky="w", padx=15, pady=5)
+        if env_pass_present:
+            ttk.Label(win, text="（已从环境变量读取）", foreground="green").grid(row=4, column=2, sticky="w", padx=(0,15))
+
+        # Driver
+        ttk.Label(win, text="ODBC 驱动 (Driver):").grid(row=5, column=0, sticky="w", padx=15, pady=5)
+        driver_var = tk.StringVar(value=cfg.get("driver", "ODBC Driver 17 for SQL Server"))
+        drivers = [
+            "ODBC Driver 17 for SQL Server",
+            "ODBC Driver 18 for SQL Server",
+            "SQL Server",
+            "ODBC Driver 13 for SQL Server"
+        ]
+        driver_combo = ttk.Combobox(win, textvariable=driver_var, values=drivers, width=37)
+        driver_combo.grid(row=5, column=1, sticky="w", padx=15, pady=5)
+
+        # Table Name
+        ttk.Label(win, text="表名 (Table):").grid(row=6, column=0, sticky="w", padx=15, pady=5)
+        table_var = tk.StringVar(value=cfg.get("table_name", "packets"))
+        ttk.Entry(win, textvariable=table_var, width=40).grid(row=6, column=1, sticky="w", padx=15, pady=5)
+
+        def save():
+            new_cfg: Dict[str, Any] = {
+                "server": server_var.get().strip(),
+                "port": port_var.get().strip(),
+                "database": database_var.get().strip(),
+                "username": username_var.get().strip(),
+                "password": password_var.get().strip(),
+                "driver": driver_var.get().strip(),
+                "table_name": table_var.get().strip(),
+            }
+            self._save_db_config(new_cfg)
+            messagebox.showinfo("成功", "数据库设置已保存")
+            win.destroy()
+
+        ttk.Button(win, text="保存", command=save).grid(row=7, column=1, sticky="w", padx=15, pady=15)
 
     # ---- LLM 相关 ----
 
