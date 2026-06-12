@@ -1,7 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-from scapy.all import wrpcap, sniff
-from scapy.utils import PcapReader
+from scapy.all import rdpcap, wrpcap, sniff
 from scapy.plist import PacketList
 from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.layers.inet6 import IPv6
@@ -27,49 +26,33 @@ from typing import Optional, Dict, Any
 
 
 class ConnStatus(Enum):
-    """TCP 连接状态枚举，包含中文详细描述，并支持正常/异常状态分类"""
-    # ==== 正常/非异常状态 (Normal Statuses) ====
-    CLOSED = ("CLOSED", "正常关闭：连接正常建立并以 FIN 挥手关闭")
-    ESTABLISHED_ONGOING = ("ESTABLISHED_ONGOING", "正常持续：连接正常建立，直到抓包结束仍在传输")
-    PRE_ESTAB_CLOSED = ("PRE_ESTAB_CLOSED", "捕获前已建连-正常关闭：抓包前连接已建立，后续以 FIN 正常关闭")
-    PRE_ESTAB_ONGOING = ("PRE_ESTAB_ONGOING", "捕获前已建连-正常持续：抓包前连接已建立，整个抓包期间持续进行")
-    ESTABLISHED_RST = ("ESTABLISHED_RST", "正常重置：连接正常建立并传输较多数据后，以 RST 释放")
+    """TCP 连接状态枚举，替代散落的魔法字符串"""
+    CLOSED = "CLOSED"
+    CONN_REFUSED = "CONN_REFUSED"
+    NO_RESPONSE = "NO_RESPONSE"
+    HANDSHAKE_FAILED = "HANDSHAKE_FAILED"
+    RST_AFTER_HANDSHAKE = "RST_AFTER_HANDSHAKE"
+    ESTABLISHED_RST = "ESTABLISHED_RST"
+    ESTABLISHED_ONGOING = "ESTABLISHED_ONGOING"
+    PRE_ESTAB_RST = "PRE_ESTAB_RST"
+    PRE_ESTAB_CLOSED = "PRE_ESTAB_CLOSED"
+    PRE_ESTAB_ONGOING = "PRE_ESTAB_ONGOING"
 
-    # ==== 异常状态 (Abnormal Statuses) ====
-    CONN_REFUSED = ("CONN_REFUSED", "连接被拒：客户端发起 SYN 后直接被对端 RST 拒绝")
-    NO_RESPONSE = ("NO_RESPONSE", "连接无响应：客户端发起 SYN 后未收到对端任何报文（可能超时或防火墙丢包）")
-    HANDSHAKE_FAILED = ("HANDSHAKE_FAILED", "握手失败：SYN 与 SYN-ACK 之后未收到最终的 ACK 确认")
-    RST_AFTER_HANDSHAKE = ("RST_AFTER_HANDSHAKE", "建连后即被重置：三次握手刚完成即被 RST 强行中断")
-    PRE_ESTAB_RST = ("PRE_ESTAB_RST", "捕获前已建连-异常重置：抓包前已建立，但在中途被 RST 异常中断")
-    DATA_TRANSFER_TIMEOUT = ("DATA_TRANSFER_TIMEOUT", "传输超时：数据发送后无响应，发生严重重传")
-    HALF_CLOSED_HANG = ("HALF_CLOSED_HANG", "半挥手卡死：一端发送 FIN 后，对端长期无 FIN 回应")
-    SYN_RETRANSMISSION = ("SYN_RETRANSMISSION", "握手重传：TCP握手期间发生SYN或SYN-ACK重传（网络质量差或丢包）")
-    ZERO_WINDOW = ("ZERO_WINDOW", "零窗口：连接期间出现TCP零窗口（对端缓存满，传输挂起）")
 
-    def __new__(cls, code: str, desc: str):
-        obj = object.__new__(cls)
-        obj._value_ = code
-        obj.desc = desc
-        return obj
-
-    @property
-    def is_normal(self) -> bool:
-        """判定该状态是否属于正常连接状态"""
-        return self in {
-            ConnStatus.CLOSED,
-            ConnStatus.ESTABLISHED_ONGOING,
-            ConnStatus.PRE_ESTAB_CLOSED,
-            ConnStatus.PRE_ESTAB_ONGOING,
-            ConnStatus.ESTABLISHED_RST
-        }
+# 非异常状态集合（用于判定连接是否正常）
+_NORMAL_STATUSES = frozenset({
+    ConnStatus.CLOSED,
+    ConnStatus.ESTABLISHED_ONGOING,
+    ConnStatus.PRE_ESTAB_CLOSED,
+    ConnStatus.PRE_ESTAB_ONGOING,
+    ConnStatus.ESTABLISHED_RST,
+})
 
 
 class WinPcapFilter:
     # ---- 常量定义 ----
     TCP_SESSION_TIMEOUT = 60.0      # 秒，超过此间隔判定为新会话
     RST_MIN_PACKETS = 4             # RST 异常判定的最小包数
-    HALF_CLOSED_TIMEOUT = 10.0      # 秒，FIN后对端不发送FIN的卡死判定时间
-    MAX_RETRANS_THRESHOLD = 3       # 次，判定为传输超时的同一数据包最大重复发送次数
     LLM_MAX_SAMPLES = 40            # 发送给 LLM 的最大样本数
     LLM_SAMPLE_PER_TYPE = 4         # 每种错误类型的最大样本数
     LLM_API_TIMEOUT = 300           # API 调用超时（秒）
@@ -81,7 +64,6 @@ class WinPcapFilter:
     DB_BATCH_SIZE = 1000            # 数据库批量插入大小
     RAW_HEX_MAX_BYTES = 2048        # raw_hex 最大存储字节数
     DISPLAY_PAGE_SIZE = 2000        # 显示区最大报文数量（避免 ScrolledText 过慢）
-    FILTER_MAX_PACKETS = 500000     # do_filter 最大保留报文数量（防止内存溢出）
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -89,7 +71,6 @@ class WinPcapFilter:
         self.root.geometry("850x680")
         self.pcap_path: str = ""
         self.all_pkts: list = []       # 原始所有报文
-        self.all_pkts_count: int = 0   # 原始报文总数
         self.filtered_pkts: list = []  # 过滤后报文
         self._busy: bool = False       # 防止重复提交
         self.init_ui()
@@ -149,136 +130,6 @@ class WinPcapFilter:
     def _update_progress(self, value: float) -> None:
         """更新进度条（线程安全，通过 root.after 调用）"""
         self.progress_var.set(value)
-
-    def _determine_tcp_status(self, pkts_list: list[tuple]) -> ConnStatus:
-        """根据 TCP 会话的所有报文特征序列判定连接状态"""
-        if not pkts_list:
-            return ConnStatus.PRE_ESTAB_ONGOING
-
-        flags_list = [p[2] for p in pkts_list]
-        
-        # 判断首个包是否包含 SYN 且非 ACK (纯发起 SYN)
-        is_syn_start = ("S" in flags_list[0] and "A" not in flags_list[0])
-
-        has_synack = any("S" in f and "A" in f for f in flags_list)
-        has_rst = any("R" in f for f in flags_list)
-        has_fin = any("F" in f for f in flags_list)
-
-        # 1. 基础状态判定
-        status = None
-        if not is_syn_start:
-            # 捕获前已建立的连接，容忍其存在
-            if has_rst:
-                status = ConnStatus.PRE_ESTAB_RST
-            elif has_fin:
-                status = ConnStatus.PRE_ESTAB_CLOSED
-            else:
-                status = ConnStatus.PRE_ESTAB_ONGOING
-        else:
-            # 从完整三次握手 SYN 开始的连接
-            if not has_synack:
-                if has_rst:
-                    status = ConnStatus.CONN_REFUSED
-                else:
-                    status = ConnStatus.NO_RESPONSE
-            else:
-                # 找到了 SYN-ACK，检查后续是否有 ACK 确认 (包括普通的 A 或者带数据的 PA 等)
-                sa_idx = -1
-                for idx, flg in enumerate(flags_list):
-                    if "S" in flg and "A" in flg:
-                        sa_idx = idx
-                        break
-
-                has_ack_after_sa = False
-                if sa_idx != -1:
-                    has_ack_after_sa = any("A" in f for f in flags_list[sa_idx + 1:])
-
-                if not has_ack_after_sa:
-                    status = ConnStatus.HANDSHAKE_FAILED
-                else:
-                    # 握手已成功建立
-                    if has_rst:
-                        # 刚建立就立刻断开 (例如包数很少) 判定为异常
-                        if len(flags_list) <= self.RST_MIN_PACKETS:
-                            status = ConnStatus.RST_AFTER_HANDSHAKE
-                        else:
-                            status = ConnStatus.ESTABLISHED_RST
-                    elif has_fin:
-                        status = ConnStatus.CLOSED
-                    else:
-                        status = ConnStatus.ESTABLISHED_ONGOING
-
-        # 2. 深度异常状态检测（仅针对已建立或捕获前建立且未被 RST 强行断开的连接）
-        if status in {ConnStatus.CLOSED, ConnStatus.ESTABLISHED_ONGOING, 
-                      ConnStatus.PRE_ESTAB_CLOSED, ConnStatus.PRE_ESTAB_ONGOING}:
-            
-            # 检测 A. 半关闭挂起 (HALF_CLOSED_HANG)
-            fin_indices = [i for i, p in enumerate(pkts_list) if "F" in p[2]]
-            if fin_indices:
-                first_fin_idx = fin_indices[0]
-                first_fin_dir = pkts_list[first_fin_idx][1]
-                # 检查首个 FIN 之后，是否有相反方向的 FIN
-                has_reverse_fin = False
-                for idx in fin_indices:
-                    if pkts_list[idx][1] != first_fin_dir:
-                        has_reverse_fin = True
-                        break
-                if not has_reverse_fin:
-                    time_span_after_fin = pkts_list[-1][3] - pkts_list[first_fin_idx][3]
-                    if time_span_after_fin >= self.HALF_CLOSED_TIMEOUT:
-                        return ConnStatus.HALF_CLOSED_HANG
-
-            # 检测 B. 数据传输超时 / 严重重传 (DATA_TRANSFER_TIMEOUT)
-            directions = set(p[1] for p in pkts_list)
-            for direct in directions:
-                # 提取该方向的所有数据包
-                dir_pkts = [p for p in pkts_list if p[1] == direct]
-                # 过滤出含有数据载荷且非握手挥手的包：排除 SYN (S) 和 FIN (F)
-                data_packets = [p for p in dir_pkts if p[6] > 0 and "S" not in p[2] and "F" not in p[2]]
-                if not data_packets:
-                    continue
-                
-                # 统计各 Seq 的出现次数
-                seq_counts = Counter(p[4] for p in data_packets)
-                # 找出重传次数 >= MAX_RETRANS_THRESHOLD 的 Seq
-                retransmitted_seqs = [seq for seq, count in seq_counts.items() if count >= self.MAX_RETRANS_THRESHOLD]
-                
-                for r_seq in retransmitted_seqs:
-                    first_tx_idx = -1
-                    r_len = 0
-                    for idx, p in enumerate(pkts_list):
-                        if p[1] == direct and p[4] == r_seq and p[6] > 0:
-                            first_tx_idx = idx
-                            r_len = p[6]
-                            break
-                    
-                    if first_tx_idx != -1:
-                        # 检查在此之后是否有相反方向的包来合理 ACK 确认该数据
-                        ack_confirmed = False
-                        for p in pkts_list[first_tx_idx + 1:]:
-                            if p[1] != direct: # 相反方向
-                                # 正常的 ACK 序号应当大于等于发送包的 Seq + Payload_Len
-                                if p[5] >= r_seq + r_len:
-                                    ack_confirmed = True
-                                    break
-                        if not ack_confirmed:
-                            return ConnStatus.DATA_TRANSFER_TIMEOUT
-
-            # 检测 C. 零窗口 (ZERO_WINDOW)
-            zero_win_pkts = [p for p in pkts_list if "A" in p[2] and "R" not in p[2] and "S" not in p[2] and len(p) > 7 and p[7] == 0]
-            if zero_win_pkts:
-                return ConnStatus.ZERO_WINDOW
-
-            # 检测 D. SYN / SYN-ACK 重传 (SYN_RETRANSMISSION)
-            syn_pkts = [p for p in pkts_list if "S" in p[2] and "A" not in p[2]]
-            syn_ack_pkts = [p for p in pkts_list if "S" in p[2] and "A" in p[2]]
-            syn_seqs = Counter(p[4] for p in syn_pkts)
-            syn_ack_seqs = Counter(p[4] for p in syn_ack_pkts)
-            if any(count >= 2 for count in syn_seqs.values()) or any(count >= 2 for count in syn_ack_seqs.values()):
-                return ConnStatus.SYN_RETRANSMISSION
-
-        return status
-
 
     @staticmethod
     def _packet_info(pkt) -> str:
@@ -406,22 +257,15 @@ class WinPcapFilter:
 
             def _load_task():
                 try:
-                    # 使用 PcapReader 流式读取计数，避免将大文件全部加载到内存
-                    count = 0
-                    with PcapReader(self.pcap_path) as reader:
-                        for _ in reader:
-                            count += 1
-                    
-                    self.root.after(0, lambda c=count: (
-                        self.show_text.insert("end", f"文件加载成功，共 {c} 条报文\n"),
-                        messagebox.showinfo("成功", f"文件加载成功，共 {c} 条报文")
+                    pkts = rdpcap(self.pcap_path)
+                    self.root.after(0, lambda p=pkts: (
+                        self.show_text.insert("end", f"文件加载成功，共 {len(p)} 条报文\n"),
+                        messagebox.showinfo("成功", f"文件加载成功，共 {len(p)} 条报文")
                     ))
-                    self.all_pkts_count = count
-                    self.all_pkts = []  # 释放内存，不再保留原始包实体列表
+                    self.all_pkts = pkts
                 except Exception as e:
                     err_msg = str(e)
                     self.root.after(0, lambda m=err_msg: messagebox.showerror("错误", f"加载文件失败：{m}"))
-                    self.all_pkts_count = 0
                     self.all_pkts = []
                 finally:
                     self.root.after(0, lambda: (
@@ -432,7 +276,7 @@ class WinPcapFilter:
             threading.Thread(target=_load_task, daemon=True).start()
 
     def do_filter(self) -> None:
-        if not self.pcap_path or not hasattr(self, "all_pkts_count") or self.all_pkts_count == 0:
+        if not self.pcap_path or not self.all_pkts:
             messagebox.showerror("错误", "请先选择并加载抓包文件！")
             return
         if self._busy:
@@ -449,43 +293,19 @@ class WinPcapFilter:
             try:
                 # 优先尝试使用 sniff 进行标准的 BPF 过滤，若失败则回退到手写的 _match_filter 进行兼容
                 if not rule:
-                    if self.all_pkts_count > self.FILTER_MAX_PACKETS:
-                        msg = f"⚠ 抓包文件过大（共 {self.all_pkts_count} 条报文），无过滤规则时仅加载前 {self.FILTER_MAX_PACKETS} 条报文以防止内存溢出。\n\n"
-                        self.root.after(0, lambda m=msg: self.show_text.insert("end", m))
-                        with PcapReader(self.pcap_path) as reader:
-                            filtered = []
-                            for _ in range(self.FILTER_MAX_PACKETS):
-                                try:
-                                    filtered.append(next(reader))
-                                except StopIteration:
-                                    break
-                    else:
-                        with PcapReader(self.pcap_path) as reader:
-                            filtered = list(reader)
+                    filtered = list(self.all_pkts)
                 else:
                     try:
-                        filtered = list(sniff(offline=self.pcap_path, filter=rule, count=self.FILTER_MAX_PACKETS))
+                        filtered = list(sniff(offline=self.pcap_path, filter=rule))
                     except Exception as bpf_err:
                         # BPF 降级时提供更清晰的提示，告知用户哪些规则可能不被支持
                         msg = (f"⚠ 标准 BPF 过滤失败，已降级为简单内置过滤器。\n"
                                f"  内置过滤器仅支持: tcp, udp, icmp, tcp port X, udp port X, ip host X\n"
                                f"  BPF 错误: {str(bpf_err)}\n\n")
                         self.root.after(0, lambda m=msg: self.show_text.insert("end", m))
-                        filtered = []
-                        with PcapReader(self.pcap_path) as reader:
-                            for p in reader:
-                                if self._match_filter(p, rule):
-                                    filtered.append(p)
-                                    if len(filtered) >= self.FILTER_MAX_PACKETS:
-                                        break
+                        filtered = [p for p in self.all_pkts if self._match_filter(p, rule)]
 
                 self.filtered_pkts = PacketList(filtered, name="filtered") if not isinstance(filtered, PacketList) else filtered
-
-                if len(self.filtered_pkts) >= self.FILTER_MAX_PACKETS:
-                    trunc_msg = (f"⚠ 匹配报文数量已达上限（{self.FILTER_MAX_PACKETS} 条），"
-                                 f"后续匹配的报文已被截断以防止内存溢出。\n"
-                                 f"完整数据请缩小过滤范围或分批处理。\n\n")
-                    self.root.after(0, lambda m=trunc_msg: self.show_text.insert("end", m))
 
                 if not self.filtered_pkts:
                     self.root.after(0, lambda: self.show_text.insert("end", "未匹配到报文\n"))
@@ -750,7 +570,6 @@ class WinPcapFilter:
 
                 conn = pyodbc.connect(conn_str)
                 cursor = conn.cursor()
-                cursor.fast_executemany = True
                 
                 # 开启显式事务以获得最佳性能并保证 ACID 原则
                 conn.autocommit = False
@@ -822,13 +641,15 @@ class WinPcapFilter:
                 """
                 cursor.execute(index_pcap_hash_sql)
 
-                # 移除旧版包级唯一索引（若存在），释放写入性能
-                # 已通过文件级 pcap_hash 查重，不再需要逐包 IGNORE_DUP_KEY 索引
-                drop_uq_sql = f"""
-                IF EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('{table_name}') AND name = 'UQ_{table_name}_packet_hash')
-                    DROP INDEX [UQ_{table_name}_packet_hash] ON [{table_name}];
+                # 建立过滤空值的唯一索引，开启 IGNORE_DUP_KEY 确保批量插入时静默过滤重复行
+                unique_packet_hash_sql = f"""
+                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('{table_name}') AND name = 'UQ_{table_name}_packet_hash')
+                    CREATE UNIQUE INDEX [UQ_{table_name}_packet_hash] 
+                    ON [{table_name}] (packet_hash) 
+                    WHERE packet_hash IS NOT NULL 
+                    WITH (IGNORE_DUP_KEY = ON);
                 """
-                cursor.execute(drop_uq_sql)
+                cursor.execute(unique_packet_hash_sql)
                 conn.commit()
 
                 file_name = os.path.basename(self.pcap_path)
@@ -914,7 +735,7 @@ class WinPcapFilter:
         threading.Thread(target=_save_db_task, daemon=True).start()
 
     def analyze_connections(self) -> None:
-        if not self.pcap_path or not hasattr(self, "all_pkts_count") or self.all_pkts_count == 0:
+        if not self.all_pkts:
             messagebox.showerror("错误", "请先选择并加载抓包文件！")
             return
         if self._busy:
@@ -938,190 +759,140 @@ class WinPcapFilter:
 
                 connections: OrderedDict = OrderedDict()
                 active_instances: Dict[tuple, Dict] = {}
-                total_pkts_count = self.all_pkts_count
+                total_pkts_count = len(self.all_pkts)
 
-                with PcapReader(self.pcap_path) as reader:
-                    for i, pkt in enumerate(reader):
-                        # 动态更新进度条 (0% - 80%)
-                        if total_pkts_count > 0 and i % 1000 == 0:
-                            progress = (i / total_pkts_count) * 80
-                            self.root.after(0, lambda p=progress: self._update_progress(p))
+                for i, pkt in enumerate(self.all_pkts):
+                    # 动态更新进度条
+                    if total_pkts_count > 0 and i % 1000 == 0:
+                        progress = (i / total_pkts_count) * 100
+                        self.root.after(0, lambda p=progress: self._update_progress(p))
 
-                        # 兼容 IPv4 和 IPv6 上的 TCP 数据包
-                        if not (TCP in pkt and (IP in pkt or IPv6 in pkt)):
-                            continue
+                    # 兼容 IPv4 和 IPv6 上的 TCP 数据包
+                    if not (TCP in pkt and (IP in pkt or IPv6 in pkt)):
+                        continue
 
-                        if IP in pkt:
-                            src_ip, dst_ip = pkt[IP].src, pkt[IP].dst
+                    if IP in pkt:
+                        src_ip, dst_ip = pkt[IP].src, pkt[IP].dst
+                    else:
+                        src_ip, dst_ip = pkt[IPv6].src, pkt[IPv6].dst
+
+                    sport, dport = pkt[TCP].sport, pkt[TCP].dport
+                    pkt_time = float(pkt.time) if hasattr(pkt, 'time') else 0.0
+                    flags = get_flags(pkt)
+
+                    # 将源和目的排序以对齐双向流量为同一个四元组
+                    endpoint_a, endpoint_b = sorted([(src_ip, sport), (dst_ip, dport)])
+                    four_tuple = (endpoint_a[0], endpoint_a[1], endpoint_b[0], endpoint_b[1])
+
+                    # 切分 TCP 生命周期的实例
+                    if four_tuple not in active_instances:
+                        active_instances[four_tuple] = {"instance_id": 0, "last_time": pkt_time}
+                    else:
+                        inst = active_instances[four_tuple]
+                        # 如果检测到新的 SYN 包（不含 ACK 才是纯发起连接的 SYN）或者时间差过大
+                        # 则判定为新起会话实例
+                        is_new_syn = ("S" in flags and "A" not in flags)
+                        time_gap = pkt_time - inst["last_time"]
+                        # 仅在正向时间差超过阈值时切分会话
+                        # 负时间差（乱序/多接口合并抓包）不触发切分，避免误判
+                        if is_new_syn or (time_gap > 0 and time_gap > self.TCP_SESSION_TIMEOUT):
+                            inst["instance_id"] += 1
+                            inst["last_time"] = pkt_time  # 彻底重置为新会话起点时间
                         else:
-                            src_ip, dst_ip = pkt[IPv6].src, pkt[IPv6].dst
+                            # 跟踪最新时间戳，确保时间差计算基于已见到的最大值
+                            inst["last_time"] = max(pkt_time, inst["last_time"])
 
-                        sport, dport = pkt[TCP].sport, pkt[TCP].dport
-                        pkt_time = float(pkt.time) if hasattr(pkt, 'time') else 0.0
-                        flags = get_flags(pkt)
+                    instance_id = active_instances[four_tuple]["instance_id"]
+                    key = (four_tuple[0], four_tuple[1], four_tuple[2], four_tuple[3], instance_id)
 
-                        # 将源和目的排序以对齐双向流量为同一个四元组
-                        endpoint_a, endpoint_b = sorted([(src_ip, sport), (dst_ip, dport)])
-                        four_tuple = (endpoint_a[0], endpoint_a[1], endpoint_b[0], endpoint_b[1])
-
-                        # 切分 TCP 生命周期的实例
-                        if four_tuple not in active_instances:
-                            active_instances[four_tuple] = {"instance_id": 0, "last_time": pkt_time}
-                        else:
-                            inst = active_instances[four_tuple]
-                            # 如果检测到新的 SYN 包（不含 ACK 才是纯发起连接 of SYN）或者时间差过大
-                            # 则判定为新起会话实例
-                            is_new_syn = ("S" in flags and "A" not in flags)
-                            time_gap = pkt_time - inst["last_time"]
-                            # 仅在正向时间差超过阈值时切分会话
-                            # 负时间差（乱序/多接口合并抓包）不触发切分，避免误判
-                            if is_new_syn or (time_gap > 0 and time_gap > self.TCP_SESSION_TIMEOUT):
-                                inst["instance_id"] += 1
-                                inst["last_time"] = pkt_time  # 彻底重置为新会话起点时间
-                            else:
-                                # 跟踪最新时间戳，确保时间差计算基于已见到的最大值
-                                inst["last_time"] = max(pkt_time, inst["last_time"])
-
-                        instance_id = active_instances[four_tuple]["instance_id"]
-                        key = (four_tuple[0], four_tuple[1], four_tuple[2], four_tuple[3], instance_id)
-
-                        if key not in connections:
-                            connections[key] = []
-                        direction = f"{src_ip}:{sport}->{dst_ip}:{dport}"
-                        
-                        # 提取深度异常检测所需的序列特征
-                        seq = pkt[TCP].seq
-                        ack = pkt[TCP].ack
-                        
-                        # 动态计算 TCP Payload 载荷长度
-                        payload_len = 0
-                        if IP in pkt:
-                            ip_len = pkt[IP].len if pkt[IP].len is not None else len(bytes(pkt[IP]))
-                            ip_hdr = pkt[IP].ihl * 4
-                            tcp_hdr = pkt[TCP].dataofs * 4 if pkt[TCP].dataofs is not None else 20
-                            payload_len = max(0, ip_len - ip_hdr - tcp_hdr)
-                        elif IPv6 in pkt:
-                            payload_len = len(bytes(pkt[TCP].payload)) if pkt[TCP].payload else 0
-                            
-                        # 提取 TCP 窗口大小
-                        window = pkt[TCP].window
-
-                        connections[key].append((i, direction, flags, pkt_time, seq, ack, payload_len, window))
+                    if key not in connections:
+                        connections[key] = []
+                    direction = f"{src_ip}:{sport}->{dst_ip}:{dport}"
+                    connections[key].append((i, direction, flags, pkt_time))
 
                 normal_lines: list[str] = []
+                error_lines: list[str] = []
                 total_pkts = sum(len(v) for v in connections.values())
                 header = [
                     f"分析时间：{datetime.datetime.now()}",
                     f"抓包文件：{self.pcap_path}",
                     f"总报文数：{total_pkts}",
-                    f"注：连接列表格式为 [发起方 IP:端口]<->[接收方 IP:端口]",
                 ]
 
                 incorrect: list[tuple] = []
-                
-                # 异常 IP 统计
-                ip_abnormal_counts = Counter()
-                ip_init_counts = Counter()
-                ip_target_counts = Counter()
-                ip_status_counts = {}
-
-                # 按状态分组存储异常连接块
-                status_groups = {}
-
-                total_conns = len(connections)
-                for conn_idx, (key, pkts_list) in enumerate(connections.items()):
-                    # 动态更新进度条 (80% - 100%)
-                    if total_conns > 0 and conn_idx % 100 == 0:
-                        progress = 80 + (conn_idx / total_conns) * 20
-                        self.root.after(0, lambda p=progress: self._update_progress(p))
-
+                for key, pkts_list in connections.items():
                     src_ip, src_port, dst_ip, dst_port, inst_id = key
                     flags_list = [f[2] for f in pkts_list]
                     flags_seq = " ".join(flags_list)
+                    short_name = f"{src_ip}:{src_port}<->{dst_ip}:{dst_port}"
 
-                    # 根据首包确定主动发起方
-                    first_pkt = pkts_list[0]
-                    first_pkt_dir = first_pkt[1] # "src_ip:sport->dst_ip:dport"
-                    init_side, target_side = first_pkt_dir.split("->")
-                    init_ip = init_side.rsplit(":", 1)[0]
-                    target_ip = target_side.rsplit(":", 1)[0]
+                    # 提取状态特征
+                    has_synack = any("S" in f and "A" in f for f in flags_list)
+                    has_rst = any("R" in f for f in flags_list)
+                    has_fin = any("F" in f for f in flags_list)
 
-                    short_name = f"{init_side}<->{target_side}"
+                    # 判断首个包是否包含 SYN 且非 ACK (纯发起 SYN)
+                    is_syn_start = ("S" in flags_list[0] and "A" not in flags_list[0]) if flags_list else False
 
-                    # 调用新提取的辅助判定函数确定状态
-                    status = self._determine_tcp_status(pkts_list)
-                    is_error = not status.is_normal
+                    if not is_syn_start:
+                        # 捕获前已建立的连接，容忍其存在
+                        if has_rst:
+                            status = ConnStatus.PRE_ESTAB_RST
+                        elif has_fin:
+                            status = ConnStatus.PRE_ESTAB_CLOSED
+                        else:
+                            status = ConnStatus.PRE_ESTAB_ONGOING
+                    else:
+                        # 从完整三次握手 SYN 开始的连接
+                        if not has_synack:
+                            if has_rst:
+                                status = ConnStatus.CONN_REFUSED
+                            else:
+                                status = ConnStatus.NO_RESPONSE
+                        else:
+                            # 找到了 SYN-ACK，检查后续是否有 ACK 确认 (包括普通的 A 或者带数据的 PA 等)
+                            sa_idx = -1
+                            for idx, flg in enumerate(flags_list):
+                                if "S" in flg and "A" in flg:
+                                    sa_idx = idx
+                                    break
 
+                            has_ack_after_sa = False
+                            if sa_idx != -1:
+                                has_ack_after_sa = any("A" in f for f in flags_list[sa_idx + 1:])
+
+                            if not has_ack_after_sa:
+                                status = ConnStatus.HANDSHAKE_FAILED
+                            else:
+                                # 握手已成功建立
+                                if has_rst:
+                                    # 刚建立就立刻断开 (例如包数很少) 判定为异常
+                                    if len(flags_list) <= self.RST_MIN_PACKETS:
+                                        status = ConnStatus.RST_AFTER_HANDSHAKE
+                                    else:
+                                        status = ConnStatus.ESTABLISHED_RST
+                                elif has_fin:
+                                    status = ConnStatus.CLOSED
+                                else:
+                                    status = ConnStatus.ESTABLISHED_ONGOING
+
+                    # 判定哪些是异常连接（使用枚举集合比较，避免字符串拼写错误）
+                    is_error = status not in _NORMAL_STATUSES
                     if is_error:
                         incorrect.append((short_name, flags_seq, status.value, len(pkts_list)))
-                        
-                        # 统计 IP 数据
-                        ip_abnormal_counts[init_ip] += 1
-                        ip_abnormal_counts[target_ip] += 1
-                        ip_init_counts[init_ip] += 1
-                        ip_target_counts[target_ip] += 1
-                        
-                        if init_ip not in ip_status_counts:
-                            ip_status_counts[init_ip] = Counter()
-                        ip_status_counts[init_ip][status.value] += 1
-                        if target_ip not in ip_status_counts:
-                            ip_status_counts[target_ip] = Counter()
-                        ip_status_counts[target_ip][status.value] += 1
 
                     conn_lines = [
                         f"{short_name:^50} | {flags_seq[:70]:^55} | {status.value:^20}",
                         f"  Instance: {inst_id} | Packets: {len(pkts_list)}",
                     ]
                     for p in pkts_list:
-                        idx, direction, fl, t = p[:4]
+                        idx, direction, fl, t = p
                         ts = datetime.datetime.fromtimestamp(float(t)).strftime("%H:%M:%S.%f")
                         conn_lines.append(f"    [{idx:>4}] {ts} {direction} [{fl}]")
                     conn_lines.append("")
 
-                    if is_error:
-                        if status not in status_groups:
-                            status_groups[status] = []
-                        status_groups[status].append(conn_lines)
-                    else:
-                        normal_lines.extend(conn_lines)
-
-                # 构建异常 IP Top 10 排行榜
-                ip_summary_lines = []
-                ip_summary_lines.append("【异常 IP Top 10 排行榜】")
-                ip_summary_lines.append("注：此处统计包含该 IP 作为发起方或接收方在异常连接中出现的总次数")
-                ip_summary_lines.append("-" * 80)
-                
-                top_ips = ip_abnormal_counts.most_common(10)
-                if not top_ips:
-                    ip_summary_lines.append("  暂无异常 IP")
-                else:
-                    for idx, (ip, count) in enumerate(top_ips, 1):
-                        init_cnt = ip_init_counts[ip]
-                        target_cnt = ip_target_counts[ip]
-                        status_dist = ip_status_counts[ip]
-                        status_dist_str = ", ".join(f"{k}: {v}次" for k, v in status_dist.most_common())
-                        ip_summary_lines.append(
-                            f"  No.{idx}  {ip:<40} | 异常总数: {count:>3} 次 | 发起: {init_cnt:>3} 次, 接收: {target_cnt:>3} 次\n"
-                            f"        状态分布: {status_dist_str}"
-                        )
-                ip_summary_lines.append("-" * 80)
-                ip_summary_lines.append("")
-
-                # 将异常连接按状态分组排列
-                error_lines = []
-                error_lines.append("================================================================================")
-                error_lines.append("【异常连接按状态类型分组详情】")
-                error_lines.append("================================================================================")
-                error_lines.append("")
-
-                for status in sorted(status_groups.keys(), key=lambda s: s.name):
-                    conns = status_groups[status]
-                    status_desc = status.desc if hasattr(status, "desc") else ""
-                    error_lines.append(f"### [{status.value}] {status_desc} (共 {len(conns)} 条连接)")
-                    error_lines.append("-" * 80)
-                    for conn_lines_block in conns:
-                        error_lines.extend(conn_lines_block)
-                    error_lines.append("")
+                    target = error_lines if is_error else normal_lines
+                    target.extend(conn_lines)
 
                 # 写正常连接文件
                 with open(normal_path, "w", encoding="utf-8") as f:
@@ -1133,7 +904,7 @@ class WinPcapFilter:
                     f"正常连接数：{len(connections) - len(incorrect)}",
                     f"异常连接数：{len(incorrect)}",
                     "",
-                ] + ip_summary_lines
+                ]
                 with open(error_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(error_header + error_lines))
 
