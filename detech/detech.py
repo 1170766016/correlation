@@ -6,6 +6,22 @@ from scapy.plist import PacketList
 from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.layers.inet6 import IPv6
 from scapy.layers.l2 import Ether
+try:
+    from scapy.layers.http import HTTP as HTTP_LAYER
+    from scapy.packet import bind_layers
+    _HTTP_AVAILABLE = True
+    # 扩展 HTTP 解码端口绑定：默认 Scapy 仅绑定 80，此处补上常见明文 HTTP 端口。
+    # 注意：443 是 HTTPS（TLS 加密），不在此绑定，避免干扰 TLS 流量分析。
+    for _p in (80, 8080, 8000, 8008, 8888):
+        try:
+            bind_layers(TCP, HTTP_LAYER, dport=_p)
+            bind_layers(TCP, HTTP_LAYER, sport=_p)
+        except Exception:
+            pass
+except ImportError:
+    HTTP_LAYER = None
+    _HTTP_AVAILABLE = False
+import re
 import os
 import json
 import datetime
@@ -24,6 +40,13 @@ import time
 from collections import OrderedDict, Counter
 from enum import Enum
 from typing import Optional, Dict, Any
+
+# 数据库操作统一委托给 db_manager 模块（存储过程化，便于维护跟踪）
+# 兼容两种运行方式：作为包内模块导入 / 作为脚本直接运行
+try:
+    from .db_manager import PcapDbManager  # 包内导入（from detech import ...）
+except ImportError:
+    from db_manager import PcapDbManager   # 直接运行 python detech.py
 
 
 class ConnStatus(Enum):
@@ -78,7 +101,10 @@ class WinPcapFilter:
     LLM_RETRY_BACKOFF = 1.0         # 重试初始退避时间（秒）
     LLM_RETRYABLE_CODES = {429, 500, 502, 503}  # 可重试的 HTTP 状态码
     UI_UPDATE_INTERVAL = 100        # 每N条报文刷新一次 UI
-    DB_BATCH_SIZE = 1000            # 数据库批量插入大小
+    DB_BATCH_SIZE = 5000            # 数据库批量插入大小（配合 fast_executemany，越大往返越少）
+    DB_PROGRESS_EVERY = 3           # 每完成 N 个批次才刷新一次进度条，降低主线程负担
+    DB_PARAM_LIMIT = 2100           # SQL Server 单语句参数硬上限
+    DB_NUM_COLUMNS = 15             # INSERT 语句的列数（占位符个数，已移除 pcap_hash）
     RAW_HEX_MAX_BYTES = 2048        # raw_hex 最大存储字节数
     DISPLAY_PAGE_SIZE = 2000        # 显示区最大报文数量（避免 ScrolledText 过慢）
     FILTER_MAX_PACKETS = 500000     # do_filter 最大保留报文数量（防止内存溢出）
@@ -92,6 +118,8 @@ class WinPcapFilter:
         self.all_pkts_count: int = 0   # 原始报文总数
         self.filtered_pkts: list = []  # 过滤后报文
         self._busy: bool = False       # 防止重复提交
+        self._db_schema_checked = False  # 同进程内表结构是否已验证过，避免每次入库重复跑 DDL 检查
+        self._cancel_event = threading.Event()  # 任务取消标志，后台线程定期检查
         self.init_ui()
 
     def init_ui(self) -> None:
@@ -106,8 +134,9 @@ class WinPcapFilter:
         filter_frame = ttk.LabelFrame(self.root, text="过滤规则（Wireshark语法）")
         filter_frame.pack(fill="x", padx=10, pady=5)
         ttk.Label(filter_frame, text="预设规则：").grid(row=0, column=0)
-        self.rule = tk.StringVar(value="tcp port 80 or 443")
+        self.rule = tk.StringVar(value='http.connection == "close"')
         rules = [
+            'http.connection == "close"',
             "tcp port 80 or 443",
             "icmp",
             "tcp",
@@ -118,33 +147,53 @@ class WinPcapFilter:
         ttk.Combobox(filter_frame, textvariable=self.rule, values=rules, width=45).grid(row=0, column=1, padx=5)
         ttk.Button(filter_frame, text="开始过滤", command=self.do_filter).grid(row=1, column=0, columnspan=2, pady=5)
 
-        # 进度条
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(self.root, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill="x", padx=10, pady=(0, 5))
+        # 操作按钮区（置于过滤规则下方，避免服务器窗口被结果区挤压导致按钮不可见）
+        btn_frame = ttk.LabelFrame(self.root, text="操作")
+        btn_frame.pack(fill="x", padx=10, pady=5)
+        for col in range(4):
+            btn_frame.columnconfigure(col, weight=1)
+        ttk.Button(btn_frame, text="导出文本", command=self.export_txt).grid(row=0, column=0, sticky="ew", padx=5, pady=4)
+        ttk.Button(btn_frame, text="保存抓包", command=self.save_pcap).grid(row=0, column=1, sticky="ew", padx=5, pady=4)
+        ttk.Button(btn_frame, text="保存到数据库", command=self.save_to_db).grid(row=0, column=2, sticky="ew", padx=5, pady=4)
+        ttk.Button(btn_frame, text="分析异常连接", command=self.analyze_connections).grid(row=0, column=3, sticky="ew", padx=5, pady=4)
+        ttk.Button(btn_frame, text="LLM分析错误", command=self.llm_analyze_errors).grid(row=1, column=0, sticky="ew", padx=5, pady=4)
+        ttk.Button(btn_frame, text="LLM设置", command=self.open_llm_settings).grid(row=1, column=1, sticky="ew", padx=5, pady=4)
+        ttk.Button(btn_frame, text="索引维护", command=self.maintain_indexes).grid(row=1, column=2, sticky="ew", padx=5, pady=4)
+        ttk.Button(btn_frame, text="数据库设置", command=self.open_db_settings).grid(row=1, column=3, sticky="ew", padx=5, pady=4)
 
-        # 结果显示区
+        # 进度条 + 取消按钮（任务执行时点击可中断后台遍历）
+        progress_frame = ttk.Frame(self.root)
+        progress_frame.pack(fill="x", padx=10, pady=(0, 5))
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(side="left", fill="x", expand=True)
+        self.cancel_btn = ttk.Button(progress_frame, text="取消", command=self._cancel_task, state="disabled")
+        self.cancel_btn.pack(side="right", padx=(5, 0))
+
+        # 结果显示区（置于底部并 expand，窗口高度不足时压缩本区而非按钮）
         result_frame = ttk.LabelFrame(self.root, text="过滤结果")
         result_frame.pack(fill="both", expand=True, padx=10, pady=5)
         self.show_text = scrolledtext.ScrolledText(result_frame, font=("Consolas", 10))
         self.show_text.pack(fill="both", expand=True)
 
-        # 导出按钮
-        btn_frame = ttk.Frame(self.root)
-        btn_frame.pack(fill="x", padx=10, pady=5)
-        ttk.Button(btn_frame, text="导出文本", command=self.export_txt).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="保存抓包", command=self.save_pcap).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="保存到数据库", command=self.save_to_db).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="分析异常连接", command=self.analyze_connections).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="LLM分析错误", command=self.llm_analyze_errors).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="LLM设置", command=self.open_llm_settings).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="数据库设置", command=self.open_db_settings).pack(side="left", padx=5)
-
     # ---- 工具方法 ----
 
     def _set_busy(self, busy: bool) -> None:
-        """设置忙碌状态，防止重复提交"""
+        """设置忙碌状态，防止重复提交；同步切换取消按钮可用性"""
         self._busy = busy
+        try:
+            self.cancel_btn.config(state="normal" if busy else "disabled")
+        except tk.TclError:
+            pass
+        if busy:
+            self._cancel_event.clear()  # 新任务开始前清空中断标志
+
+    def _cancel_task(self) -> None:
+        """用户点击取消按钮：设置中断标志，后台线程下次检查点会退出"""
+        self._cancel_event.set()
+        self.show_text.insert("end", "\n⚠ 已请求取消，正在等待当前批次处理完毕...\n")
+        self.show_text.see("end")
+        self.cancel_btn.config(state="disabled")  # 防止重复点击
 
     def _update_progress(self, value: float) -> None:
         """更新进度条（线程安全，通过 root.after 调用）"""
@@ -386,7 +435,40 @@ class WinPcapFilter:
                 return pkt[IP].src == host or pkt[IP].dst == host
             return False
 
+        # http.connection == "close" 等 Wireshark 显示过滤（非 BPF，由内置解析器支持）
+        if rule.startswith("http.connection"):
+            m = re.match(r'http\.connection\s*==\s*"([^"]*)"', rule)
+            if not m:
+                return False
+            return self._match_http_header(pkt, "connection", m.group(1))
+
         # 未知规则，不进行匹配
+        return False
+
+    @staticmethod
+    def _match_http_header(pkt, header_name: str, target_value: str) -> bool:
+        """匹配 HTTP 报文头字段值（大小写不敏感），支持 http.connection == "close" 这类显示过滤。
+        依赖 scapy.layers.http 解码（导入该模块即自动绑定 TCP 80<->HTTP）。
+        只读取头部前 8KB，避免大文件上传场景下把整个 HTTP body 拉进内存。"""
+        if not _HTTP_AVAILABLE or HTTP_LAYER is None:
+            return False
+        if HTTP_LAYER not in pkt:
+            return False
+        try:
+            # 只取前 8KB：HTTP 头部远小于此，body 可能几十 MB，全读会撑爆内存
+            raw = bytes(pkt[HTTP_LAYER])[:8192]
+            # 头部与 body 以 \r\n\r\n 分隔；若前 8KB 没找到分隔符，说明头部异常长或非标准
+            header_block = raw.split(b'\r\n\r\n', 1)[0]
+            text = header_block.decode('latin-1', errors='replace')
+            lines = text.split('\r\n')
+            # 第一行是请求行/状态行，从第二行起为头部
+            for line in lines[1:]:
+                if ':' in line:
+                    name, _, value = line.partition(':')
+                    if name.strip().lower() == header_name.lower():
+                        return value.strip().lower() == target_value.strip().lower()
+        except Exception:
+            pass
         return False
 
     def choose_file(self) -> None:
@@ -400,53 +482,112 @@ class WinPcapFilter:
             self.pcap_path = path
             self.path_var.set(path)
             self.show_text.delete(1.0, "end")
-            self.show_text.insert("end", f"已选择：{path}\n正在加载并解析文件，请稍候...\n")
+            self.show_text.insert("end", f"已选择：{path}\n")
             self._set_busy(True)
             self._update_progress(0)
+            # 切到不确定模式：加载阶段不知道总包数，进度条来回滚动表示在干活
+            try:
+                self.progress_bar.config(mode="indeterminate")
+                self.progress_bar.start(15)  # 每 15ms 推进一步
+            except tk.TclError:
+                pass
+
+            # 记录开始时间，用于显示加载耗时
+            load_start_time = time.time()
 
             def _load_task():
                 try:
-                    # 使用 PcapReader 流式读取计数，避免将大文件全部加载到内存
+                    # 第一阶段：流式扫描计数，实时显示已扫描包数（避免用户以为卡住）
                     count = 0
+                    last_report = 0
                     with PcapReader(self.pcap_path) as reader:
-                        for _ in reader:
+                        for i, _ in enumerate(reader):
                             count += 1
-                    
-                    self.root.after(0, lambda c=count: (
-                        self.show_text.insert("end", f"文件加载成功，共 {c} 条报文\n"),
-                        messagebox.showinfo("成功", f"文件加载成功，共 {c} 条报文")
-                    ))
+                            # 中断检查点
+                            if i % 10000 == 0 and self._cancel_event.is_set():
+                                self.root.after(0, lambda: self.show_text.insert("end", "⚠ 已取消文件加载\n"))
+                                return
+                            # 每 50000 包或每 1 秒报告一次进度（取较大间隔，避免 UI 抖动）
+                            if count - last_report >= 50000:
+                                last_report = count
+                                elapsed = time.time() - load_start_time
+                                rate = count / elapsed if elapsed > 0 else 0
+                                msg = f"  正在扫描报文... 已读取 {count:,} 条 ({rate:,.0f} 包/秒, 已用 {elapsed:.1f}s)\n"
+                                self.root.after(0, lambda m=msg: (
+                                    self.show_text.delete("end-2l", "end"),  # 删除上一行进度
+                                    self.show_text.insert("end", m),
+                                    self.show_text.see("end")
+                                ))
+
+                    if self._cancel_event.is_set():
+                        return
+
+                    elapsed = time.time() - load_start_time
                     self.all_pkts_count = count
-                    self.all_pkts = []  # 释放内存，不再保留原始包实体列表
+                    self.all_pkts = []
+
+                    # 停止不确定模式进度条
+                    self.root.after(0, lambda: (
+                        self.progress_bar.stop(),
+                        self.progress_bar.config(mode="determinate"),
+                        self._update_progress(100),
+                        self.show_text.delete("end-3l", "end"),  # 清掉进度行
+                        self.show_text.insert("end",
+                            f"✓ 文件加载完成，共 {count:,} 条报文（耗时 {elapsed:.1f}s）\n"
+                        ),
+                        self.show_text.see("end")
+                    ))
+
+                    # 第二阶段：自动触发过滤分析，让用户立即看到结果而不是干等
+                    self.root.after(0, lambda: self.show_text.insert(
+                        "end", "→ 自动开始过滤分析...\n"
+                    ))
+                    # 用 after 延迟一下，让 UI 先刷新
+                    self.root.after(100, lambda: self.do_filter(auto_triggered=True))
+
                 except Exception as e:
                     err_msg = str(e)
-                    self.root.after(0, lambda m=err_msg: messagebox.showerror("错误", f"加载文件失败：{m}"))
+                    self.root.after(0, lambda m=err_msg: (
+                        self.progress_bar.stop(),
+                        self.progress_bar.config(mode="determinate"),
+                        messagebox.showerror("错误", f"加载文件失败：{m}")
+                    ))
                     self.all_pkts_count = 0
                     self.all_pkts = []
                 finally:
                     self.root.after(0, lambda: (
                         self._set_busy(False),
-                        self._update_progress(100)
                     ))
 
             threading.Thread(target=_load_task, daemon=True).start()
 
-    def do_filter(self) -> None:
+    def do_filter(self, auto_triggered: bool = False) -> None:
         if not self.pcap_path or not hasattr(self, "all_pkts_count") or self.all_pkts_count == 0:
             messagebox.showerror("错误", "请先选择并加载抓包文件！")
             return
         if self._busy:
-            messagebox.showwarning("提示", "上一个任务正在执行中，请稍候")
+            # 自动触发的过滤不弹窗警告（避免加载完紧接着自动过滤时被 busy 拦截）
+            if not auto_triggered:
+                messagebox.showwarning("提示", "上一个任务正在执行中，请稍候")
             return
 
         rule = self.rule.get().strip()
-        self.show_text.delete(1.0, "end")
-        self.show_text.insert("end", f"正在过滤：{rule}\n")
+        if not auto_triggered:
+            self.show_text.delete(1.0, "end")
+        self.show_text.insert("end", f"正在过滤：{rule or '（无规则，加载全部）'}\n")
+        self.show_text.see("end")
         self._set_busy(True)
         self._update_progress(0)
 
+        filter_start_time = time.time()
+
         def _filter_task():
             try:
+                # sniff 是黑盒，无法实时报告进度，先用不确定模式让进度条滚动
+                self.root.after(0, lambda: (
+                    self.progress_bar.config(mode="indeterminate"),
+                    self.progress_bar.start(15)
+                ))
                 # 优先尝试使用 sniff 进行标准的 BPF 过滤，若失败则回退到手写的 _match_filter 进行兼容
                 if not rule:
                     if self.all_pkts_count > self.FILTER_MAX_PACKETS:
@@ -454,26 +595,39 @@ class WinPcapFilter:
                         self.root.after(0, lambda m=msg: self.show_text.insert("end", m))
                         with PcapReader(self.pcap_path) as reader:
                             filtered = []
-                            for _ in range(self.FILTER_MAX_PACKETS):
+                            for i in range(self.FILTER_MAX_PACKETS):
+                                # 中断检查点：每 5000 包查一次取消标志
+                                if i % 5000 == 0 and self._cancel_event.is_set():
+                                    self.root.after(0, lambda: self.show_text.insert("end", "⚠ 已取消过滤任务\n"))
+                                    return
                                 try:
                                     filtered.append(next(reader))
                                 except StopIteration:
                                     break
                     else:
                         with PcapReader(self.pcap_path) as reader:
-                            filtered = list(reader)
+                            filtered = []
+                            for i, p in enumerate(reader):
+                                if i % 5000 == 0 and self._cancel_event.is_set():
+                                    self.root.after(0, lambda: self.show_text.insert("end", "⚠ 已取消过滤任务\n"))
+                                    return
+                                filtered.append(p)
                 else:
                     try:
                         filtered = list(sniff(offline=self.pcap_path, filter=rule, count=self.FILTER_MAX_PACKETS))
                     except Exception as bpf_err:
                         # BPF 降级时提供更清晰的提示，告知用户哪些规则可能不被支持
                         msg = (f"⚠ 标准 BPF 过滤失败，已降级为简单内置过滤器。\n"
-                               f"  内置过滤器仅支持: tcp, udp, icmp, tcp port X, udp port X, ip host X\n"
+                               f"  内置过滤器仅支持: tcp, udp, icmp, tcp port X, udp port X, ip host X, http.connection\n"
                                f"  BPF 错误: {str(bpf_err)}\n\n")
                         self.root.after(0, lambda m=msg: self.show_text.insert("end", m))
                         filtered = []
                         with PcapReader(self.pcap_path) as reader:
-                            for p in reader:
+                            for i, p in enumerate(reader):
+                                # 降级路径单线程遍历全包，必须支持中断，否则大文件 UI 假死
+                                if i % 5000 == 0 and self._cancel_event.is_set():
+                                    self.root.after(0, lambda: self.show_text.insert("end", "⚠ 已取消过滤任务\n"))
+                                    return
                                 if self._match_filter(p, rule):
                                     filtered.append(p)
                                     if len(filtered) >= self.FILTER_MAX_PACKETS:
@@ -492,8 +646,13 @@ class WinPcapFilter:
                     return
 
                 total = len(self.filtered_pkts)
-                header = f"找到 {total} 条报文\n" + "-" * 80 + "\n\n"
-                self.root.after(0, lambda h=header: self.show_text.insert("end", h))
+                filter_elapsed = time.time() - filter_start_time
+                header = (f"✓ 过滤完成，找到 {total:,} 条报文（耗时 {filter_elapsed:.1f}s）\n"
+                          + "-" * 80 + "\n\n")
+                self.root.after(0, lambda h=header: (
+                    self.show_text.insert("end", h),
+                    self.show_text.see("end")
+                ))
 
                 # 如果报文数超过显示上限，提示并截断显示
                 display_count = min(total, self.DISPLAY_PAGE_SIZE)
@@ -520,13 +679,23 @@ class WinPcapFilter:
                     text_block = "".join(batch_lines)
                     self.root.after(0, lambda t=text_block: self.show_text.insert("end", t))
 
-                self.root.after(0, lambda: self._update_progress(100))
+                self.root.after(0, lambda: (
+                    self.progress_bar.stop(),
+                    self.progress_bar.config(mode="determinate"),
+                    self._update_progress(100)
+                ))
 
             except Exception as e:
                 err_msg = f"过滤失败：{str(e)}"
-                self.root.after(0, lambda m=err_msg: messagebox.showerror("过滤失败", m))
+                self.root.after(0, lambda m=err_msg: (
+                    self.progress_bar.stop(),
+                    self.progress_bar.config(mode="determinate"),
+                    messagebox.showerror("过滤失败", m)
+                ))
             finally:
-                self.root.after(0, lambda: self._set_busy(False))
+                self.root.after(0, lambda: (
+                    self._set_busy(False),
+                ))
 
         threading.Thread(target=_filter_task, daemon=True).start()
 
@@ -580,7 +749,7 @@ class WinPcapFilter:
             threading.Thread(target=_save_pcap_task, daemon=True).start()
 
     @staticmethod
-    def _packet_to_row(pcap_file: str, pkt, pcap_hash: Optional[str] = None) -> tuple:
+    def _packet_to_row(pcap_file: str, pkt, insert_time=None) -> tuple:
         ts = float(pkt.time) if hasattr(pkt, 'time') else None
         packet_time = datetime.datetime.fromtimestamp(ts) if ts is not None else None
         file_name = os.path.basename(pcap_file) if pcap_file else None
@@ -606,25 +775,28 @@ class WinPcapFilter:
             sport, dport = None, None
 
         # 提取 TCP 报文的特有字段 (flag, seq, ack, len)
+        # 同时内联构造 info 摘要，复用同一份层对象，避免再调用 _packet_info 造成重复 getlayer
         flag_val = None
         seq_val = None
         ack_val = None
         len_val = None
+        info_parts: list[str] = []
 
         if tcp_layer:
             t = tcp_layer
+            f_val = t.flags
             flags = []
-            if t.flags & 0x02: flags.append("SYN")
-            if t.flags & 0x10: flags.append("ACK")
-            if t.flags & 0x01: flags.append("FIN")
-            if t.flags & 0x04: flags.append("RST")
-            if t.flags & 0x08: flags.append("PSH")
-            if t.flags & 0x20: flags.append("URG")
-            flag_val = " ".join(flags) if flags else str(t.flags)
-            
+            if f_val & 0x02: flags.append("SYN")
+            if f_val & 0x10: flags.append("ACK")
+            if f_val & 0x01: flags.append("FIN")
+            if f_val & 0x04: flags.append("RST")
+            if f_val & 0x08: flags.append("PSH")
+            if f_val & 0x20: flags.append("URG")
+            flag_val = " ".join(flags) if flags else str(f_val)
+
             seq_val = t.seq
             ack_val = t.ack
-            
+
             # 计算载荷长度
             payload_len = 0
             if ip_layer:
@@ -636,48 +808,61 @@ class WinPcapFilter:
                 payload_len = len(bytes(t.payload)) if t.payload else 0
             len_val = payload_len
 
-        # 构造定制的 summary 字段格式
-        summary_lines = []
-        ts_str = packet_time.strftime("%Y-%m-%d %H:%M:%S.%f") if packet_time else "N/A"
-        summary_lines.append(f"时间：{ts_str}")
-        if ether_layer:
-            summary_lines.append(f"MAC：{ether_layer.src} → {ether_layer.dst}")
-        if ip_layer:
-            summary_lines.append(f"IP：{ip_layer.src} → {ip_layer.dst}")
-        elif ipv6_layer:
-            summary_lines.append(f"IPv6：{ipv6_layer.src} → {ipv6_layer.dst}")
-        if tcp_layer:
-            summary_lines.append(f"TCP 端口：{tcp_layer.sport} → {tcp_layer.dport}")
+            info_parts.append(f"[{flag_val}] Seq={seq_val} Ack={ack_val} Len={payload_len}")
         elif udp_layer:
-            summary_lines.append(f"UDP 端口：{udp_layer.sport} → {udp_layer.dport}")
-        summary_lines.append(f"Info：{WinPcapFilter._packet_info(pkt)}")
+            u = udp_layer
+            info_parts.append(f"Len={u.len}")
+
+        # ICMP 层（保持与原 _packet_info 输出一致）
+        if not info_parts:
+            icmp_layer = pkt.getlayer(ICMP)
+            if icmp_layer:
+                info_parts.append(f"Type={icmp_layer.type} Code={icmp_layer.code}")
+
+        # info 地址部分（复用已提取的层对象，不再二次 getlayer）
+        port_s = f":{sport}" if (tcp_layer or udp_layer) else ""
+        port_d = f":{dport}" if (tcp_layer or udp_layer) else ""
+        if ip_layer:
+            info_parts.append(f"{ip_src}{port_s} > {ip_dst}{port_d}")
+        elif ipv6_layer:
+            info_parts.append(f"{ip_src}{port_s} > {ip_dst}{port_d}")
+        info_val = " ".join(info_parts)
+
+        # 构造 summary（复用已提取字段，移除对 _packet_info 的二次调用，省去约 5 次 getlayer）
+        ts_str = packet_time.strftime("%Y-%m-%d %H:%M:%S.%f") if packet_time else "N/A"
+        summary_lines = [f"时间：{ts_str}"]
+        if ether_layer:
+            summary_lines.append(f"MAC：{mac_src} → {mac_dst}")
+        if ip_layer:
+            summary_lines.append(f"IP：{ip_src} → {ip_dst}")
+        elif ipv6_layer:
+            summary_lines.append(f"IPv6：{ip_src} → {ip_dst}")
+        if tcp_layer:
+            summary_lines.append(f"TCP 端口：{sport} → {dport}")
+        elif udp_layer:
+            summary_lines.append(f"UDP 端口：{sport} → {dport}")
+        summary_lines.append(f"Info：{info_val}")
         summary_val = "\n".join(summary_lines)
 
-        insert_time = datetime.datetime.now()
+        if insert_time is None:
+            insert_time = datetime.datetime.now()
 
-        # 计算单条报文的唯一哈希值
-        h_pkt = hashlib.md5()
+        # 计算单条报文唯一哈希：用于区分唯一报文
+        # 优化点：仅基于结构化字段单次拼接一次 update，比原始版本（多次 update + bytes(pkt)）快很多
+        # 字段选择：时间戳+MAC+IP+端口+flag+seq+ack+len 组合已足够唯一标识一条报文
         pkt_ts_str = f"{ts:.6f}" if ts is not None else ""
-        h_pkt.update(pkt_ts_str.encode('utf-8'))
-        h_pkt.update(str(mac_src or '').encode('utf-8'))
-        h_pkt.update(str(mac_dst or '').encode('utf-8'))
-        h_pkt.update(str(ip_src or '').encode('utf-8'))
-        h_pkt.update(str(ip_dst or '').encode('utf-8'))
-        h_pkt.update(str(sport or '').encode('utf-8'))
-        h_pkt.update(str(dport or '').encode('utf-8'))
-        h_pkt.update(str(flag_val or '').encode('utf-8'))
-        h_pkt.update(str(seq_val or '').encode('utf-8'))
-        h_pkt.update(str(ack_val or '').encode('utf-8'))
-        h_pkt.update(str(len_val or '').encode('utf-8'))
-        try:
-            h_pkt.update(bytes(pkt))
-        except Exception:
-            pass
-        packet_hash = h_pkt.hexdigest()
+        hash_src = "|".join([
+            pkt_ts_str,
+            str(mac_src or ''), str(mac_dst or ''),
+            str(ip_src or ''), str(ip_dst or ''),
+            str(sport or ''), str(dport or ''),
+            str(flag_val or ''), str(seq_val or ''),
+            str(ack_val or ''), str(len_val or '')
+        ]).encode('utf-8')
+        packet_hash = hashlib.md5(hash_src).hexdigest()
 
         return (
             file_name,
-            pcap_hash,
             packet_hash,
             packet_time,
             mac_src, mac_dst,
@@ -701,7 +886,7 @@ class WinPcapFilter:
 
         if pyodbc is None:
             messagebox.showerror(
-                "驱动错误", 
+                "驱动错误",
                 "未找到 pyodbc 模块。请在您的 Python 环境中安装 pyodbc 以连接 SQL Server：\n"
                 "  pip install pyodbc"
             )
@@ -709,11 +894,7 @@ class WinPcapFilter:
 
         cfg = self._load_db_config()
         server = cfg.get("server", "localhost")
-        port = cfg.get("port", "1433")
         database = cfg.get("database", "pcap_db")
-        username = cfg.get("username", "")
-        password = cfg.get("password", "")
-        driver = cfg.get("driver", "ODBC Driver 17 for SQL Server")
         table_name = cfg.get("table_name", "packets")
 
         if not server or not database:
@@ -723,195 +904,267 @@ class WinPcapFilter:
 
         self._set_busy(True)
         self._update_progress(0)
-        self.show_text.insert("end", f"\n正在保存数据到 SQL Server 数据库 {server} ({database})...\n")
+        self.show_text.insert(
+            "end",
+            f"\n正在保存数据到 SQL Server 数据库 {server} ({database})...\n"
+        )
 
         def _save_db_task():
-            conn = None
+            mgr: Optional[PcapDbManager] = None
             try:
-                # 计算当前 PCAP 文件的 MD5 哈希指纹
-                pcap_hash = ""
-                if os.path.exists(self.pcap_path):
-                    md5 = hashlib.md5()
-                    try:
-                        with open(self.pcap_path, "rb") as f:
-                            for chunk in iter(lambda: f.read(4096), b""):
-                                md5.update(chunk)
-                        pcap_hash = md5.hexdigest()
-                    except Exception:
-                        pass
+                # 1. 创建数据库管理器并连接
+                mgr = PcapDbManager(cfg)
+                mgr.connect()
 
-                # 构造 SQL Server 连接字符串
-                if username:
-                    # 使用 SQL Server 身份验证
-                    conn_str = f"DRIVER={{{driver}}};SERVER={server},{port};DATABASE={database};UID={username};PWD={password}"
-                else:
-                    # 使用 Windows 身份验证
-                    conn_str = f"DRIVER={{{driver}}};SERVER={server},{port};DATABASE={database};Trusted_Connection=yes"
+                # 2. 部署存储过程检查（首次使用时提示，不影响后续流程）
+                #    注意：is_schema_deployed 用独立 cursor，不影响 mgr.cursor
+                try:
+                    schema_ok = mgr.is_schema_deployed(mgr.conn)
+                except Exception:
+                    schema_ok = True  # 检测失败时不阻塞主流程，让 ensure_schema 自己处理
+                if not schema_ok:
+                    self.root.after(0, lambda: (
+                        self.show_text.insert(
+                            "end",
+                            "⚠ 警告：未检测到存储过程，建议在数据库执行 db_schema.sql 部署：\n"
+                            "  sqlcmd -S localhost -E -d pcap_db -i db_schema.sql\n"
+                            "  当前将使用兜底内联 SQL 模式（功能正常但失去集中维护优势）\n\n"
+                        ),
+                    ))
 
-                conn = pyodbc.connect(conn_str)
-                cursor = conn.cursor()
-                cursor.fast_executemany = True
-                
-                # 开启显式事务以获得最佳性能并保证 ACID 原则
-                conn.autocommit = False
+                # 3. 确保表结构（调用 sp_ensure_pcap_table，同连接内只执行一次）
+                mgr.ensure_schema(table_name)
 
-                # 创建表的 SQL 语句，增加 pcap_hash 和 packet_hash 字段，使用方括号防止保留字冲突
-                create_table_sql = f"""
-                IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{table_name}' AND xtype='U')
-                CREATE TABLE [{table_name}] (
-                    id          INT IDENTITY(1,1) PRIMARY KEY,
-                    pcap_file   VARCHAR(255),
-                    pcap_hash   VARCHAR(64),
-                    packet_hash VARCHAR(64),
-                    timestamp   DATETIME2(6),
-                    mac_src     VARCHAR(20),
-                    mac_dst     VARCHAR(20),
-                    ip_src      VARCHAR(45),
-                    ip_dst      VARCHAR(45),
-                    sport       INT,
-                    dport       INT,
-                    flag        VARCHAR(30),
-                    seq         BIGINT,
-                    ack         BIGINT,
-                    len         INT,
-                    summary     NVARCHAR(300),
-                    insert_time DATETIME2(3)
-                )
-                """
-                cursor.execute(create_table_sql)
-                conn.commit()
-
-                # 如果表已经存在，则自动检查并添加缺少的列，确保平滑升级
-                alter_table_sql = f"""
-                IF EXISTS (SELECT * FROM sysobjects WHERE name='{table_name}' AND xtype='U')
-                BEGIN
-                    -- 如果 timestamp 字段还是 FLOAT 类型，则将其转换为 DATETIME2(6)
-                    IF EXISTS (SELECT * FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id WHERE c.object_id = OBJECT_ID('{table_name}') AND c.name = 'timestamp' AND t.name != 'datetime2')
-                        ALTER TABLE [{table_name}] ALTER COLUMN timestamp DATETIME2(6);
-                        
-                    -- 添加缺少的列，采用紧凑的长度设计以节省空间
-                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'pcap_hash')
-                        ALTER TABLE [{table_name}] ADD pcap_hash VARCHAR(64);
-                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'packet_hash')
-                        ALTER TABLE [{table_name}] ADD packet_hash VARCHAR(64);
-                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'flag')
-                        ALTER TABLE [{table_name}] ADD flag VARCHAR(30);
-                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'seq')
-                        ALTER TABLE [{table_name}] ADD seq BIGINT;
-                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'ack')
-                        ALTER TABLE [{table_name}] ADD ack BIGINT;
-                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'len')
-                        ALTER TABLE [{table_name}] ADD len INT;
-                    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'insert_time')
-                        ALTER TABLE [{table_name}] ADD insert_time DATETIME2(3);
-                END
-                """
-                cursor.execute(alter_table_sql)
-                conn.commit()
-
-                # 建立非聚集索引以确保在大数据量下的文件名、哈希寻靶性能（Index Seek）
-                index_pcap_file_sql = f"""
-                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('{table_name}') AND name = 'IX_{table_name}_pcap_file')
-                    CREATE INDEX [IX_{table_name}_pcap_file] ON [{table_name}] (pcap_file);
-                """
-                cursor.execute(index_pcap_file_sql)
-
-                index_pcap_hash_sql = f"""
-                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('{table_name}') AND name = 'IX_{table_name}_pcap_hash')
-                    CREATE INDEX [IX_{table_name}_pcap_hash] ON [{table_name}] (pcap_hash);
-                """
-                cursor.execute(index_pcap_hash_sql)
-
-                # 移除旧版包级唯一索引（若存在），释放写入性能
-                # 已通过文件级 pcap_hash 查重，不再需要逐包 IGNORE_DUP_KEY 索引
-                drop_uq_sql = f"""
-                IF EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('{table_name}') AND name = 'UQ_{table_name}_packet_hash')
-                    DROP INDEX [UQ_{table_name}_packet_hash] ON [{table_name}];
-                """
-                cursor.execute(drop_uq_sql)
-                conn.commit()
-
+                # 4. 文件级查重：仅按文件名判断是否已入库
                 file_name = os.path.basename(self.pcap_path)
+                status = mgr.check_duplicate(table_name, file_name)
 
-                # 1. 检查是否存在相同内容指纹的文件已保存在数据库（支持防改名重复上传）
-                if pcap_hash:
-                    cursor.execute(f"SELECT DISTINCT pcap_file FROM [{table_name}] WHERE pcap_hash = ?", (pcap_hash,))
-                    existing_file_row = cursor.fetchone()
-                    if existing_file_row:
-                        existing_filename = existing_file_row[0]
-                        self.root.after(0, lambda: (
-                            self.show_text.insert("end", f"检测到数据库中已存在相同内容的抓包文件（原文件名：{existing_filename}），已自动跳过导入。\n"),
-                            messagebox.showinfo("提示", f"抓包文件内容已存在于数据库中（原文件名：{existing_filename}），无需重复保存。")
-                        ))
-                        return
+                if status == 1:
+                    # 同名文件已存在 → 覆盖（先删旧数据，释放锁后再插入）
+                    self.root.after(0, lambda: self.show_text.insert(
+                        "end",
+                        f"检测到同名文件 {file_name} 已入库，正在覆盖旧数据...\n"
+                    ))
+                    deleted = mgr.delete_by_file(table_name, file_name)
+                    mgr.commit()  # 立即提交删除，释放锁
+                    self.root.after(0, lambda d=deleted: self.show_text.insert(
+                        "end", f"已删除旧数据 {d} 条（已提交）\n"
+                    ))
 
-                # 2. 检查文件名是否相同
-                cursor.execute(f"SELECT DISTINCT pcap_hash FROM [{table_name}] WHERE pcap_file = ?", (file_name,))
-                existing_rows = cursor.fetchall()
-                if existing_rows:
-                    has_same_hash = any(r[0] == pcap_hash for r in existing_rows)
-                    if has_same_hash:
-                        self.root.after(0, lambda: (
-                            self.show_text.insert("end", f"检测到数据库中已存在同名且内容相同的抓包文件 {file_name}，已自动跳过导入。\n"),
-                            messagebox.showinfo("提示", f"同名且内容相同的抓包文件 {file_name} 已存在，已自动跳过。")
-                        ))
-                        return
-                    else:
-                        # 覆盖旧数据（删除当前同名文件的记录）
-                        self.root.after(0, lambda: self.show_text.insert("end", f"检测到同名但内容不同的抓包文件 {file_name}，正在覆盖数据库中的旧数据...\n"))
-                        cursor.execute(f"DELETE FROM [{table_name}] WHERE pcap_file = ?", (file_name,))
-
-                sql = f"""
-                    INSERT INTO [{table_name}]
-                        (pcap_file, pcap_hash, packet_hash, timestamp, mac_src, mac_dst,
-                         ip_src, ip_dst, sport, dport, flag,
-                         seq, ack, len, summary, insert_time)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """
-
-                # 分批插入，避免一次性构建所有 row 占用过多内存并突破 pyodbc 单次参数上限
+                # 5. 批量插入（仍用 executemany + INSERT VALUES，性能最优）
+                #    insert_batch 内置分段提交（每 5 批 commit），无需调用方再 commit
+                batch_insert_time = datetime.datetime.now()
                 total = len(self.filtered_pkts)
-                inserted = 0
-                for batch_start in range(0, total, self.DB_BATCH_SIZE):
-                    batch_end = min(batch_start + self.DB_BATCH_SIZE, total)
-                    rows = []
-                    for j in range(batch_start, batch_end):
-                        rows.append(self._packet_to_row(
-                            self.pcap_path, self.filtered_pkts[j], pcap_hash
-                        ))
-                    cursor.executemany(sql, rows)
-                    inserted += len(rows)
 
-                    # 动态更新进度条
+                # 一次构造所有行，直接传入 insert_time 避免二次遍历
+                all_rows = [
+                    self._packet_to_row(self.pcap_path, pkt, insert_time=batch_insert_time)
+                    for pkt in self.filtered_pkts
+                ]
+
+                def progress_cb(inserted: int, total: int) -> None:
                     if total > 0:
                         progress = (inserted / total) * 100
                         self.root.after(0, lambda p=progress: self._update_progress(p))
 
-                conn.commit()  # 提交所有事务
+                def cancel_check() -> bool:
+                    return self._cancel_event.is_set()
+
+                inserted = mgr.insert_batch(
+                    table_name=table_name,
+                    rows=all_rows,
+                    batch_size=self.DB_BATCH_SIZE,
+                    progress_cb=progress_cb,
+                    cancel_check=cancel_check,
+                )
+
+                if self._cancel_event.is_set():
+                    # 用户取消：insert_batch 已回滚未提交段，已 commit 的段保留
+                    self.root.after(0, lambda i=inserted: (
+                        self.show_text.insert("end", f"⚠ 已取消入库，已提交 {i} 条（未提交部分已回滚）\n"),
+                        messagebox.showinfo("已取消", f"入库任务已取消，已提交 {i} 条数据")
+                    ))
+                    return
+
+                # insert_batch 内部已分段 commit，这里无需再 commit
                 self.root.after(0, lambda i=inserted: (
                     self.show_text.insert("end", f"已成功保存 {i} 条报文至 SQL Server 表 [{table_name}]\n"),
                     messagebox.showinfo("成功", f"已成功保存 {i} 条报文到 SQL Server")
                 ))
+
+                # 入库完成后异步检查索引碎片，结果直接显示到主面板（不弹窗，避免每次入库打扰）
+                try:
+                    need_maintain, frag_info = mgr.needs_maintenance(table_name)
+                    if need_maintain:
+                        bad_indexes = [
+                            f for f in frag_info if f["recommend"] in ("rebuild", "reorganize")
+                        ]
+                        report_lines = ["⚠ 检测到索引碎片过高，建议维护："]
+                        for idx in bad_indexes:
+                            action = "重建" if idx["recommend"] == "rebuild" else "重组"
+                            report_lines.append(
+                                f"  {idx['name']}: 碎片率 {idx['fragmentation_pct']}% "
+                                f"({idx['page_count']} 页 / {idx['size_mb']} MB) → 建议{action}"
+                            )
+                        report_lines.append("  点击「索引维护」按钮可执行维护操作")
+                        report = "\n".join(report_lines)
+                        self.root.after(0, lambda r=report: (
+                            self.show_text.insert("end", "\n" + r + "\n"),
+                            self.show_text.see("end")
+                        ))
+                    else:
+                        # 状态良好时也简短提示一下，让用户知道检查过
+                        self.root.after(0, lambda: (
+                            self.show_text.insert("end", "（索引碎片检查通过，状态良好）\n"),
+                            self.show_text.see("end")
+                        ))
+                except Exception as frag_err:
+                    # 碎片检查失败不影响主流程，仅记录日志
+                    self.root.after(0, lambda e=str(frag_err): self.show_text.insert(
+                        "end", f"（索引碎片检查跳过：{e}）\n"
+                    ))
             except Exception as e:
-                if conn:
-                    try:
-                        conn.rollback()  # 发生任何异常，全部事务强制回滚
-                    except Exception:
-                        pass
+                if mgr:
+                    mgr.rollback()
                 err_msg = str(e)
                 self.root.after(0, lambda m=err_msg: messagebox.showerror("错误", f"保存数据库失败：{m}"))
             finally:
-                if conn:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                if mgr:
+                    mgr.close()
                 self.root.after(0, lambda: (
                     self._set_busy(False),
                     self._update_progress(100)
                 ))
 
         threading.Thread(target=_save_db_task, daemon=True).start()
+
+    def maintain_indexes(self) -> None:
+        """索引维护：检查碎片率，按需重组/重建"""
+        if self._busy:
+            messagebox.showwarning("提示", "当前有任务正在执行，请稍候")
+            return
+        if pyodbc is None:
+            messagebox.showerror("错误", "未找到 pyodbc 模块")
+            return
+
+        cfg = self._load_db_config()
+        table_name = cfg.get("table_name", "packets")
+        if not cfg.get("server") or not cfg.get("database"):
+            messagebox.showerror("错误", "请先配置数据库")
+            self.open_db_settings()
+            return
+
+        self._set_busy(True)
+        self._update_progress(0)
+        self.show_text.insert("end", "\n正在检查索引碎片情况...\n")
+
+        def _maintain_task():
+            mgr: Optional[PcapDbManager] = None
+            try:
+                mgr = PcapDbManager(cfg)
+                mgr.connect()
+
+                # 1. 查询碎片
+                frag_info = mgr.get_index_fragmentation(table_name)
+
+                if not frag_info:
+                    self.root.after(0, lambda: (
+                        self.show_text.insert("end", "未找到索引（表可能未建索引）\n"),
+                        messagebox.showinfo("索引维护", "未找到索引")
+                    ))
+                    return
+
+                # 2. 显示碎片报告
+                report_lines = ["【索引碎片报告】", "-" * 60]
+                for idx in frag_info:
+                    action_map = {"rebuild": "→ 建议重建", "reorganize": "→ 建议重组", "ok": "✓ 正常"}
+                    report_lines.append(
+                        f"{idx['name']:<35} 碎片率: {idx['fragmentation_pct']:>6.2f}%  "
+                        f"页数: {idx['page_count']:>8}  大小: {idx['size_mb']:>8.2f}MB  {action_map[idx['recommend']]}"
+                    )
+                report_lines.append("-" * 60)
+                report = "\n".join(report_lines)
+                self.root.after(0, lambda r=report: self.show_text.insert("end", r + "\n"))
+
+                # 3. 找出需要维护的索引
+                to_rebuild = [f for f in frag_info if f["recommend"] == "rebuild"]
+                to_reorganize = [f for f in frag_info if f["recommend"] == "reorganize"]
+
+                if not to_rebuild and not to_reorganize:
+                    self.root.after(0, lambda: messagebox.showinfo("索引维护", "所有索引状态良好，无需维护"))
+                    return
+
+                # 4. 询问用户是否执行维护
+                action_desc = []
+                if to_rebuild:
+                    action_desc.append(f"重建 {len(to_rebuild)} 个索引（{', '.join(i['name'] for i in to_rebuild)}）")
+                if to_reorganize:
+                    action_desc.append(f"重组 {len(to_reorganize)} 个索引（{', '.join(i['name'] for i in to_reorganize)}）")
+                confirm_msg = (
+                    f"检测到以下索引需要维护：\n\n"
+                    + "\n".join(action_desc) +
+                    f"\n\n是否立即执行？\n"
+                    f"  - 重组：轻量级，不锁表，可继续入库\n"
+                    f"  - 重建：重量级，可能锁表，建议空闲时执行\n"
+                    f"  - ONLINE 重建（如支持）不锁表但占用 tempdb"
+                )
+
+                # 用线程安全的 messagebox.askyesno
+                import queue
+                result_queue = queue.Queue()
+                self.root.after(0, lambda: result_queue.put(messagebox.askyesno("确认维护", confirm_msg)))
+                user_confirm = result_queue.get(timeout=30)  # 等 30 秒
+
+                if not user_confirm:
+                    self.root.after(0, lambda: self.show_text.insert("end", "用户取消维护\n"))
+                    return
+
+                # 5. 执行维护
+                total_actions = len(to_rebuild) + len(to_reorganize)
+                done = 0
+
+                # 先做重组（快）
+                for idx in to_reorganize:
+                    self.root.after(0, lambda n=idx['name']: self.show_text.insert(
+                        "end", f"正在重组索引 {n}...\n"
+                    ))
+                    mgr.reorganize_index(table_name, idx["name"])
+                    done += 1
+                    self.root.after(0, lambda p=(done/total_actions*100): self._update_progress(p))
+
+                # 再做重建（慢，尝试 ONLINE 模式）
+                for idx in to_rebuild:
+                    self.root.after(0, lambda n=idx['name']: self.show_text.insert(
+                        "end", f"正在重建索引 {n}...\n"
+                    ))
+                    try:
+                        mgr.rebuild_index(table_name, idx["name"], online=True)
+                    except Exception:
+                        # ONLINE 不支持（Standard 版）回退到离线重建
+                        self.root.after(0, lambda n=idx['name']: self.show_text.insert(
+                            "end", f"  ONLINE 重建不可用，改用离线重建 {n}...\n"
+                        ))
+                        mgr.rebuild_index(table_name, idx["name"], online=False)
+                    done += 1
+                    self.root.after(0, lambda p=(done/total_actions*100): self._update_progress(p))
+
+                self.root.after(0, lambda: (
+                    self.show_text.insert("end", f"索引维护完成，共处理 {total_actions} 个索引\n"),
+                    messagebox.showinfo("完成", f"索引维护完成，共处理 {total_actions} 个索引")
+                ))
+
+            except Exception as e:
+                err_msg = str(e)
+                self.root.after(0, lambda m=err_msg: messagebox.showerror("错误", f"索引维护失败：{m}"))
+            finally:
+                if mgr:
+                    mgr.close()
+                self.root.after(0, lambda: (
+                    self._set_busy(False),
+                    self._update_progress(100)
+                ))
+
+        threading.Thread(target=_maintain_task, daemon=True).start()
 
     def analyze_connections(self) -> None:
         if not self.pcap_path or not hasattr(self, "all_pkts_count") or self.all_pkts_count == 0:
@@ -926,8 +1179,9 @@ class WinPcapFilter:
         base = str(pathlib.Path(self.pcap_path).with_suffix(""))
         normal_path = base + "_正常.txt"
         error_path = base + "_异常.txt"
-        self.show_text.insert("end", f"\n正在分析TCP连接（后台运行中）...\n")
-        self.root.update()
+        self.show_text.insert("end", f"\n开始分析 TCP 连接状态...\n")
+        self.show_text.see("end")
+        analyze_start_time = time.time()
 
         def _analyze_task():
             try:
@@ -939,13 +1193,32 @@ class WinPcapFilter:
                 connections: OrderedDict = OrderedDict()
                 active_instances: Dict[tuple, Dict] = {}
                 total_pkts_count = self.all_pkts_count
+                analyze_stage_start = time.time()
 
                 with PcapReader(self.pcap_path) as reader:
                     for i, pkt in enumerate(reader):
-                        # 动态更新进度条 (0% - 80%)
-                        if total_pkts_count > 0 and i % 1000 == 0:
+                        # 动态更新进度条 (0% - 80%) + 实时状态文本
+                        if total_pkts_count > 0 and i % 10000 == 0:
                             progress = (i / total_pkts_count) * 80
-                            self.root.after(0, lambda p=progress: self._update_progress(p))
+                            elapsed = time.time() - analyze_stage_start
+                            rate = i / elapsed if elapsed > 0 else 0
+                            pct = (i / total_pkts_count * 100) if total_pkts_count > 0 else 0
+                            # 每 50000 包输出一次进度，避免刷屏
+                            if i % 50000 == 0 and i > 0:
+                                status = f"  扫描进度: {pct:.1f}% ({i:,}/{total_pkts_count:,}) - {rate:,.0f} 包/秒\n"
+                                self.root.after(0, lambda s=status: (
+                                    self.show_text.delete("end-2l", "end"),
+                                    self.show_text.insert("end", s),
+                                    self.show_text.see("end"),
+                                    self._update_progress(progress)
+                                ))
+                            else:
+                                self.root.after(0, lambda p=progress: self._update_progress(p))
+
+                        # 中断检查点：每 5000 包查一次取消标志
+                        if i % 5000 == 0 and self._cancel_event.is_set():
+                            self.root.after(0, lambda: self.show_text.insert("end", "⚠ 已取消连接分析任务\n"))
+                            return
 
                         # 兼容 IPv4 和 IPv6 上的 TCP 数据包
                         if not (TCP in pkt and (IP in pkt or IPv6 in pkt)):
@@ -1029,6 +1302,14 @@ class WinPcapFilter:
                 status_groups = {}
 
                 total_conns = len(connections)
+                # 第二阶段开始：状态判定
+                self.root.after(0, lambda: (
+                    self.show_text.delete("end-2l", "end"),
+                    self.show_text.insert("end",
+                        f"✓ 扫描完成，共 {total_conns:,} 条 TCP 连接，正在判定状态...\n"
+                    ),
+                    self.show_text.see("end")
+                ))
                 for conn_idx, (key, pkts_list) in enumerate(connections.items()):
                     # 动态更新进度条 (80% - 100%)
                     if total_conns > 0 and conn_idx % 100 == 0:
@@ -1137,14 +1418,15 @@ class WinPcapFilter:
                 with open(error_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(error_header + error_lines))
 
-                result_msg = (f"分析完成，共 {len(connections)} 条连接，"
-                              f"异常 {len(incorrect)} 条\n"
-                              f"正常→{normal_path}\n"
-                              f"异常→{error_path}\n")
+                result_msg = (f"✓ 分析完成，共 {len(connections):,} 条连接，"
+                              f"异常 {len(incorrect):,} 条（总耗时 {time.time()-analyze_start_time:.1f}s）\n"
+                              f"  正常 → {normal_path}\n"
+                              f"  异常 → {error_path}\n")
                 info_msg = (f"分析完成\n正常连接：{len(connections) - len(incorrect)} 条→{normal_path}\n"
                             f"异常连接：{len(incorrect)} 条→{error_path}")
                 self.root.after(0, lambda r=result_msg, i=info_msg: (
-                    self.show_text.insert("end", r),
+                    self.show_text.insert("end", "\n" + r),
+                    self.show_text.see("end"),
                     messagebox.showinfo("成功", i),
                 ))
 
