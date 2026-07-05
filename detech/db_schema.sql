@@ -60,7 +60,12 @@ BEGIN
         ack         BIGINT,
         len         INT,
         summary     NVARCHAR(300),
-        insert_time DATETIME2(3)
+        insert_time DATETIME2(3),
+        post_url    NVARCHAR(2000),
+        client_time DATETIME2(3),
+        payload_hash VARCHAR(32),
+        direction   VARCHAR(10),
+        frame_number BIGINT
     );';
     EXEC sp_executesql @sql;
 
@@ -82,7 +87,12 @@ BEGIN
         (N'seq',         N'BIGINT'),
         (N'ack',         N'BIGINT'),
         (N'len',         N'INT'),
-        (N'insert_time', N'DATETIME2(3)');
+        (N'insert_time', N'DATETIME2(3)'),
+        (N'post_url',    N'NVARCHAR(2000)'),
+        (N'client_time', N'DATETIME2(3)'),
+        (N'payload_hash',N'VARCHAR(32)'),
+        (N'direction',   N'VARCHAR(10)'),
+        (N'frame_number',N'BIGINT');
 
     DECLARE @col_name NVARCHAR(64), @col_def NVARCHAR(200);
     DECLARE col_cur CURSOR LOCAL FAST_FORWARD FOR
@@ -121,6 +131,19 @@ BEGIN
         CREATE UNIQUE INDEX ' + @uq_name + N' ON ' + @tbl + N' (packet_hash)
         WHERE packet_hash IS NOT NULL
         WITH (IGNORE_DUP_KEY = ON);';
+    EXEC sp_executesql @sql;
+
+    -- 1.6 维护业务相关的组合索引
+    DECLARE @idx_payload_hash NVARCHAR(258) = QUOTENAME('IX_' + @table_name + N'_payload_hash');
+    SET @sql = N'
+    IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID(''dbo.' + @tbl + N''') AND name = ''' + REPLACE('IX_' + @table_name + N'_payload_hash', '''', '''''') + N''')
+        CREATE INDEX ' + @idx_payload_hash + N' ON ' + @tbl + N' (payload_hash, timestamp);';
+    EXEC sp_executesql @sql;
+
+    DECLARE @idx_client_time NVARCHAR(258) = QUOTENAME('IX_' + @table_name + N'_client_time');
+    SET @sql = N'
+    IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID(''dbo.' + @tbl + N''') AND name = ''' + REPLACE('IX_' + @table_name + N'_client_time', '''', '''''') + N''')
+        CREATE INDEX ' + @idx_client_time + N' ON ' + @tbl + N' (client_time, post_url) INCLUDE (ip_src, ip_dst, sport, dport);';
     EXEC sp_executesql @sql;
 END;
 GO

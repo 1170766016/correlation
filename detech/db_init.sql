@@ -54,7 +54,12 @@ BEGIN
         ack         BIGINT        NULL,                     -- TCP 确认号
         len         INT           NULL,                     -- TCP 载荷长度
         summary     NVARCHAR(300) NULL,                     -- 报文摘要（人类可读）
-        insert_time DATETIME2(3)  NULL                      -- 入库时间
+        insert_time DATETIME2(3)  NULL,                     -- 入库时间
+        post_url    NVARCHAR(2000) NULL,                    -- HTTP POST 请求路径
+        client_time DATETIME2(3)  NULL,                     -- 客户端发送时间（从 JSON 载荷提取）
+        payload_hash VARCHAR(32)  NULL,                     -- HTTP 载荷 MD5 指纹（用于链路跨段关联）
+        direction   VARCHAR(10)   NULL,                     -- 流量方向（如 REQ, RES）
+        frame_number BIGINT       NULL                      -- PCAP 报文序号
     );
 
     PRINT N'表 dbo.packets 创建成功';
@@ -75,6 +80,23 @@ END
 ELSE
 BEGIN
     PRINT N'索引 IX_packets_pcap_file 已存在，跳过';
+END
+GO
+
+/* ============================================================================
+   2.1 索引 - 业务查询与关联索引
+============================================================================ */
+IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.packets') AND name = 'IX_packets_payload_hash')
+BEGIN
+    CREATE INDEX IX_packets_payload_hash ON dbo.packets (payload_hash, timestamp);
+    PRINT N'索引 IX_packets_payload_hash 创建成功';
+END
+GO
+
+IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.packets') AND name = 'IX_packets_client_time')
+BEGIN
+    CREATE INDEX IX_packets_client_time ON dbo.packets (client_time, post_url) INCLUDE (ip_src, ip_dst, sport, dport);
+    PRINT N'索引 IX_packets_client_time 创建成功';
 END
 GO
 
@@ -156,9 +178,16 @@ GO
   len         TCP 载荷字节数，由 IP.len - IP头 - TCP头 计算得出
   summary     报文可读摘要，含时间/MAC/IP/端口/Info，NVARCHAR(300) 应对中文
   insert_time 入库时间戳，用于排查入库顺序问题
+  post_url    HTTP POST 请求路径，业务事件类型
+  client_time 客户端发送时间戳，DATETIME2(3) 精确到毫秒，从 200KB 的 JSON 载荷(sendTime) 中提取
+  payload_hash 载荷 MD5 指纹，VARCHAR(32)，用于跨代理服务器的前后段链路关联
+  direction   流量方向
+  frame_number 报文在原 PCAP 文件中的偏移/序号，用于界面按需读取载荷详情
 
   索引说明：
   IX_packets_pcap_file       按文件名查询，覆盖导入/按文件统计场景
+  IX_packets_payload_hash    按哈希和时间查询，用于 200 毫秒时间窗口的跨代理解析自关联
+  IX_packets_client_time     按客户端时间和 URL 查询，支持 IP/端口 的 INCLUDE (业务侧快速排查)
   UQ_packets_packet_hash     报文级唯一索引，IGNORE_DUP_KEY=ON 静默去重
   （已移除 IX_packets_pcap_hash，因为不再有 pcap_hash 字段）
 ================================================================================

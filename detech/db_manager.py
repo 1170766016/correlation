@@ -52,8 +52,8 @@ class PcapDbManager:
     # SQL Server 单语句参数硬上限
     PARAM_LIMIT = 2100
     # INSERT 语句的列数（与表结构一一对应，修改时务必同步）
-    # 已移除 pcap_hash，列数从 16 降到 15
-    NUM_COLUMNS = 15
+    # 新增 5 个字段：post_url, client_time, payload_hash, direction, frame_number，列数增加到 20
+    NUM_COLUMNS = 20
     # 默认批量大小（依赖 fast_executemany）
     DEFAULT_BATCH_SIZE = 5000
     # 索引碎片率阈值：超过此值建议重建
@@ -178,7 +178,9 @@ class PcapDbManager:
                 timestamp DATETIME2(6), mac_src VARCHAR(20), mac_dst VARCHAR(20),
                 ip_src VARCHAR(45), ip_dst VARCHAR(45), sport INT, dport INT,
                 flag VARCHAR(30), seq BIGINT, ack BIGINT, len INT,
-                summary NVARCHAR(300), insert_time DATETIME2(3)
+                summary NVARCHAR(300), insert_time DATETIME2(3),
+                post_url NVARCHAR(2000), client_time DATETIME2(3),
+                payload_hash VARCHAR(32), direction VARCHAR(10), frame_number BIGINT
             )
             """)
             self.cursor.execute(f"""
@@ -273,6 +275,47 @@ class PcapDbManager:
             return self.cursor.rowcount
 
     # ------------------------------------------------------------------
+    # 业务查询逻辑
+    # ------------------------------------------------------------------
+
+    def analyze_cross_proxy_links(self, table_name: str) -> list[tuple]:
+        """跨代理链路关联分析
+        
+        基于 payload_hash 自关联，时间窗口 <= 200 毫秒。
+        由于我们提取了 HTTP POST 且打上了 Hash 指纹，可无视 IP 转换精确配对。
+        返回 (client_ip, client_request_time, web_server_ip, proxy_forward_time, proxy_latency, post_url)
+        """
+        if not self.cursor:
+            raise RuntimeError("未建立数据库连接")
+            
+        sql = f"""
+        SELECT 
+            inbound.ip_src AS client_ip,
+            inbound.timestamp AS client_request_time,
+            outbound.ip_dst AS web_server_ip,
+            outbound.timestamp AS proxy_forward_time,
+            DATEDIFF(millisecond, inbound.timestamp, outbound.timestamp) AS proxy_latency,
+            inbound.post_url
+        FROM [{table_name}] inbound
+        INNER JOIN [{table_name}] outbound 
+            ON inbound.payload_hash = outbound.payload_hash
+            AND inbound.payload_hash IS NOT NULL
+            AND outbound.timestamp >= inbound.timestamp
+            AND outbound.timestamp <= DATEADD(millisecond, 200, inbound.timestamp)
+        WHERE 
+            -- 这里可以通过 IP 段来精确区分 inbound 和 outbound，为了演示泛用性，利用时间先后
+            inbound.id != outbound.id
+        ORDER BY inbound.timestamp
+        """
+        try:
+            self.cursor.execute(sql)
+            rows = self.cursor.fetchall()
+            return [tuple(r) for r in rows]
+        except Exception as e:
+            # 捕获异常，避免崩溃
+            raise RuntimeError(f"链路关联查询失败: {str(e)}")
+
+    # ------------------------------------------------------------------
     # 批量插入（性能敏感，不走存储过程）
     # ------------------------------------------------------------------
 
@@ -320,8 +363,9 @@ class PcapDbManager:
         sql = (
             f"INSERT INTO [{table_name}] "
             f"(pcap_file, packet_hash, timestamp, mac_src, mac_dst, "
-            f" ip_src, ip_dst, sport, dport, flag, seq, ack, len, summary, insert_time) "
-            f"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            f" ip_src, ip_dst, sport, dport, flag, seq, ack, len, summary, insert_time, "
+            f" post_url, client_time, payload_hash, direction, frame_number) "
+            f"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         )
 
         # fast_executemany 不可用时的安全批量大小
